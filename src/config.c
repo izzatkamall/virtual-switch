@@ -15,6 +15,9 @@ void config_defaults(struct config *c)
     c->mac_per_port = 16;
     c->port_wait = 5;
     c->rate_limit = 0;
+    for (int p = 0; p < MAX_PORTS; p++)
+        c->port_vlan[p] = 1;
+    c->trunk_port = -1;
 }
 
 // reads a whole number, returns -1 if it isnt one or is out of range
@@ -46,18 +49,30 @@ int config_load(const char *path, struct config *c)
         lineno++;
         line[strcspn(line, "#\r\n")] = '\0';  // drop comments and newline
 
-        char key[64], val[64], extra[8];
-        int n = sscanf(line, "%63s %63s %7s", key, val, extra);
+        char key[64], val[64], val2[64], extra[8];
+        int n = sscanf(line, "%63s %63s %63s %7s", key, val, val2, extra);
         if (n <= 0)
             continue;  // empty line
-        if (n != 2) {
-            log_msg("%s:%d: expected 'key value'", path, lineno);
+
+        // port_vlan is the only one with two values
+        int want = strcmp(key, "port_vlan") == 0 ? 3 : 2;
+        if (n != want) {
+            log_msg("%s:%d: wrong number of values for %s", path, lineno, key);
             bad = 1;
             continue;
         }
 
         int rc;
-        if (strcmp(key, "mac_age") == 0)
+        if (strcmp(key, "port_vlan") == 0) {
+            int port, vlan;
+            rc = parse_int(val, 0, MAX_PORTS - 1, &port);
+            if (rc == 0)
+                rc = parse_int(val2, VLAN_MIN, VLAN_MAX, &vlan);
+            if (rc == 0)
+                tmp.port_vlan[port] = vlan;
+        } else if (strcmp(key, "trunk_port") == 0)
+            rc = parse_int(val, -1, MAX_PORTS - 1, &tmp.trunk_port);
+        else if (strcmp(key, "mac_age") == 0)
             rc = parse_int(val, 1, 86400, &tmp.mac_age);
         else if (strcmp(key, "mac_max") == 0)
             rc = parse_int(val, 1, 1000000, &tmp.mac_max);

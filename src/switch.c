@@ -83,6 +83,9 @@ struct port {
     struct qos out;
     unsigned long dropped;
 
+    int vlan;   // vlan of an access port
+    int trunk;  // 1 if this port carries every vlan
+
     // token bucket, in tenths of a frame so slow rates still work
     // with 100ms ticks. rate 0 means no limit
     int rate;
@@ -108,6 +111,26 @@ static struct config get_config(void)
     return c;
 }
 
+// changes a port's vlan, its macs are forgotten since they were learned
+// in the old vlan
+static void set_port_vlan(int p, int vlan, int trunk)
+{
+    struct port *pt = &ports[p];
+    pthread_mutex_lock(&pt->lock);
+    int changed = pt->vlan != vlan || pt->trunk != trunk;
+    pt->vlan = vlan;
+    pt->trunk = trunk;
+    pthread_mutex_unlock(&pt->lock);
+
+    if (changed) {
+        mac_table_remove_port(&table, p);
+        if (trunk)
+            log_msg("port %d is the trunk", p);
+        else
+            log_msg("port %d is in vlan %d", p, vlan);
+    }
+}
+
 // loads the config file and puts the new values into use
 static int apply_config(void)
 {
@@ -121,6 +144,9 @@ static int apply_config(void)
 
     mac_table_set_limits(&table, c.mac_max, c.mac_per_port);
     mac_table_trim(&table);  // in case mac_max got smaller
+
+    for (int p = 0; p < num_ports; p++)
+        set_port_vlan(p, c.port_vlan[p], c.trunk_port == p);
     return 0;
 }
 
@@ -144,29 +170,39 @@ static struct timespec deadline_in(int ms)
 }
 
 // puts a frame on a port queue, never blocks
-// if the queue is full the frame is dropped and counted
-static void port_enqueue(int p, struct pkt *k)
+// returns 1 if queued, 0 if the queue was full (dropped and counted),
+// -1 if the port is down or not in the frame's vlan
+static int port_enqueue(int p, struct pkt *k)
 {
     struct port *pt = &ports[p];
+    int rc;
 
     pthread_mutex_lock(&pt->lock);
-    if (pt->state != PORT_UP) {
-        pthread_mutex_unlock(&pt->lock);
-        return;
-    }
-    if (qos_push(&pt->out, k->h.priority, k, now_ms()) < 0) {
+    if (pt->state != PORT_UP || (!pt->trunk && pt->vlan != k->h.vlan)) {
+        rc = -1;
+    } else if (qos_push(&pt->out, k->h.priority, k, now_ms()) < 0) {
         pt->dropped++;  // that priority queue is full
-        pthread_mutex_unlock(&pt->lock);
-        return;
+        rc = 0;
+    } else {
+        pkt_get(k);  // the queue holds a reference now
+        pthread_cond_signal(&pt->not_empty);
+        rc = 1;
     }
-    pkt_get(k);  // the queue holds a reference now
-    pthread_cond_signal(&pt->not_empty);
     pthread_mutex_unlock(&pt->lock);
+    return rc;
 }
 
 // returns -1 if the port broke port security and has to be shut
-static int forward(int in_port, const struct frame_header *h, const uint8_t *payload)
+static int forward(int in_port, struct frame_header *h, const uint8_t *payload)
 {
+    // access ports put the frame in their own vlan, the trunk keeps
+    // whatever vlan the frame already says
+    struct port *in = &ports[in_port];
+    pthread_mutex_lock(&in->lock);
+    if (!in->trunk)
+        h->vlan = (uint16_t)in->vlan;
+    pthread_mutex_unlock(&in->lock);
+
     if (mac_table_insert(&table, h->src, in_port) == MAC_PORT_FULL) {
         log_msg("port %d has more than %d macs, shutting it down", in_port, get_config().mac_per_port);
         return -1;
@@ -184,10 +220,10 @@ static int forward(int in_port, const struct frame_header *h, const uint8_t *pay
     if (k == NULL)
         return 0;
 
-    if (out >= 0) {
-        port_enqueue(out, k);
-    } else {
-        // broadcast or unknown dest, send to everyone else
+    // known dest, unless its in another vlan, then treat it as unknown
+    if (out < 0 || port_enqueue(out, k) < 0) {
+        // broadcast or unknown dest, send to everyone else in the vlan
+        // port_enqueue skips ports in other vlans
         for (int p = 0; p < num_ports; p++) {
             if (p != in_port)
                 port_enqueue(p, k);
@@ -378,8 +414,8 @@ static void *signal_thread(void *arg)
                 log_msg("got SIGHUP but there is no config file");
             } else if (apply_config() == 0) {
                 struct config c = get_config();
-                log_msg("reloaded %s: mac_age %d mac_max %d mac_per_port %d port_wait %d rate_limit %d",
-                       cfg_path, c.mac_age, c.mac_max, c.mac_per_port, c.port_wait, c.rate_limit);
+                log_msg("reloaded %s: mac_age %d mac_max %d mac_per_port %d port_wait %d rate_limit %d trunk_port %d",
+                       cfg_path, c.mac_age, c.mac_max, c.mac_per_port, c.port_wait, c.rate_limit, c.trunk_port);
             } else {
                 log_msg("config has errors, keeping the old settings");
             }
@@ -573,6 +609,20 @@ int main(int argc, char *argv[])
         fprintf(stderr, "mac_table_init failed\n");
         return 1;
     }
+    for (int p = 0; p < num_ports; p++) {
+        ports[p].id = p;
+        ports[p].fd = -1;
+        ports[p].state = PORT_FREE;
+        ports[p].vlan = 1;
+        ports[p].trunk = 0;
+        if (pthread_mutex_init(&ports[p].lock, NULL) != 0 ||
+            pthread_cond_init(&ports[p].not_empty, NULL) != 0) {
+            fprintf(stderr, "port init failed\n");
+            return 1;
+        }
+    }
+
+    // ports have to exist first since the config sets their vlans
     config_defaults(&cfg);
     if (argc == 4)
         cfg_path = argv[3];
@@ -580,16 +630,6 @@ int main(int argc, char *argv[])
         fprintf(stderr, "could not load config %s\n", cfg_path);
         mac_table_destroy(&table);
         return 1;
-    }
-    for (int p = 0; p < num_ports; p++) {
-        ports[p].id = p;
-        ports[p].fd = -1;
-        ports[p].state = PORT_FREE;
-        if (pthread_mutex_init(&ports[p].lock, NULL) != 0 ||
-            pthread_cond_init(&ports[p].not_empty, NULL) != 0) {
-            fprintf(stderr, "port init failed\n");
-            return 1;
-        }
     }
 
     if (sem_init(&free_ports, 0, (unsigned int)num_ports) != 0) {
