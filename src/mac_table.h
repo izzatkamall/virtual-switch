@@ -2,6 +2,7 @@
 //
 // hash table with one mutex per bucket (striped locking)
 // a thread only ever holds one bucket lock at a time so it cant deadlock
+// count_lock is always taken last and nothing is locked while holding it
 
 #ifndef MAC_TABLE_H
 #define MAC_TABLE_H
@@ -13,6 +14,7 @@
 #include "frame.h"
 
 #define MAC_TABLE_BUCKETS 16
+#define MAC_TABLE_DEFAULT_MAX 1024
 
 struct mac_entry {
     uint8_t mac[MAC_LEN];
@@ -28,6 +30,10 @@ struct mac_bucket {
 
 struct mac_table {
     struct mac_bucket buckets[MAC_TABLE_BUCKETS];
+
+    pthread_mutex_t count_lock;  // protects count and max_entries
+    int count;
+    int max_entries;
 };
 
 // what mac_table_insert did
@@ -39,6 +45,8 @@ enum {
 };
 
 int mac_table_init(struct mac_table *t);
+void mac_table_set_max(struct mac_table *t, int max_entries);
+int mac_table_count(struct mac_table *t);
 void mac_table_destroy(struct mac_table *t);
 
 int mac_table_insert(struct mac_table *t, const uint8_t mac[MAC_LEN], int port);

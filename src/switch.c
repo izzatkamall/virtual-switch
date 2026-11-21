@@ -29,6 +29,7 @@
 #define MAX_PORTS 64
 #define QUEUE_LEN 64  // frames waiting per port
 #define MAC_AGE_SECS 30  // forget a mac not seen for this long
+#define MAC_MAX_ENTRIES 1024  // biggest the mac table can get
 
 // one received frame, shared by every queue it goes into
 // refs counts how many queues still hold it, the last one frees it
@@ -347,6 +348,7 @@ int main(int argc, char *argv[])
         fprintf(stderr, "mac_table_init failed\n");
         return 1;
     }
+    mac_table_set_max(&table, MAC_MAX_ENTRIES);
     for (int p = 0; p < num_ports; p++) {
         ports[p].id = p;
         ports[p].fd = -1;

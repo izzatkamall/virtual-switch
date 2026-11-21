@@ -84,6 +84,54 @@ static void test_mac_basic(void)
     mac_table_destroy(&t);
 }
 
+// counts entries by walking the lists, to compare with the counter
+static int real_count(struct mac_table *t)
+{
+    int n = 0;
+    for (int i = 0; i < MAC_TABLE_BUCKETS; i++)
+        for (struct mac_entry *e = t->buckets[i].head; e != NULL; e = e->next)
+            n++;
+    return n;
+}
+
+static void test_mac_lru(void)
+{
+    struct mac_table t;
+    CHECK(mac_table_init(&t) == 0);
+    mac_table_set_max(&t, 3);
+    struct timespec wait = {0, 5 * 1000000};  // 5ms so timestamps differ
+
+    uint8_t m[5][MAC_LEN];
+    for (int i = 0; i < 5; i++) {
+        uint8_t x[MAC_LEN] = {2, 0, 0, 0, 1, (uint8_t)i};
+        memcpy(m[i], x, MAC_LEN);
+    }
+
+    for (int i = 0; i < 3; i++) {
+        mac_table_insert(&t, m[i], i);
+        nanosleep(&wait, NULL);
+    }
+    CHECK(mac_table_count(&t) == 3);
+
+    // touch m0 so m1 is now the oldest
+    mac_table_insert(&t, m[0], 0);
+    nanosleep(&wait, NULL);
+
+    mac_table_insert(&t, m[3], 3);  // full, m1 should go
+    CHECK(mac_table_count(&t) == 3);
+    CHECK(mac_table_lookup(&t, m[1]) == -1);
+    CHECK(mac_table_lookup(&t, m[0]) == 0);
+    CHECK(mac_table_lookup(&t, m[2]) == 2);
+    CHECK(mac_table_lookup(&t, m[3]) == 3);
+
+    nanosleep(&wait, NULL);
+    mac_table_insert(&t, m[4], 4);  // now m2 is oldest
+    CHECK(mac_table_lookup(&t, m[2]) == -1);
+    CHECK(mac_table_count(&t) == 3);
+
+    mac_table_destroy(&t);
+}
+
 static void test_mac_aging(void)
 {
     struct mac_table t;
@@ -124,8 +172,9 @@ static void *worker(void *arg)
         uint8_t mac[MAC_LEN] = {0x02, 0, 0, 0, 0, (uint8_t)(i % 200)};
         if (mac_table_insert(&shared, mac, port) == MAC_ERROR)
             return (void *)1;
+        // could be evicted already, but if found the port must be sane
         int p = mac_table_lookup(&shared, mac);
-        if (p < 0 || p >= NTHREADS)
+        if (p < -1 || p >= NTHREADS)
             return (void *)1;
     }
     return NULL;
@@ -137,6 +186,7 @@ static void test_mac_threads(void)
     int ports[NTHREADS];
 
     CHECK(mac_table_init(&shared) == 0);
+    mac_table_set_max(&shared, 50);  // forces lots of evictions while threads run
     for (int i = 0; i < NTHREADS; i++) {
         ports[i] = i;
         CHECK(pthread_create(&th[i], NULL, worker, &ports[i]) == 0);
@@ -146,6 +196,8 @@ static void test_mac_threads(void)
         CHECK(pthread_join(th[i], &ret) == 0);
         CHECK(ret == NULL);
     }
+    CHECK(mac_table_count(&shared) <= 50);
+    CHECK(mac_table_count(&shared) == real_count(&shared));
     mac_table_destroy(&shared);
 }
 
@@ -154,6 +206,7 @@ int main(void)
     test_frame();
     test_mac_basic();
     test_mac_aging();
+    test_mac_lru();
 
     // the thread test prints a lot of mac moved lines, hide them
     if (freopen("/dev/null", "w", stderr) == NULL)
