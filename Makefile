@@ -10,8 +10,8 @@ TESTS = test_frame_mac test_net_io
 
 all: $(PROGS) $(TESTS)
 
-switch: src/switch.c src/mac_table.c $(COMMON) $(HDRS)
-	$(CC) $(CFLAGS) -o $@ src/switch.c src/mac_table.c $(COMMON) $(LIBS)
+switch: src/switch.c src/mac_table.c src/config.c $(COMMON) $(HDRS)
+	$(CC) $(CFLAGS) -o $@ src/switch.c src/mac_table.c src/config.c $(COMMON) $(LIBS)
 
 host: src/host.c $(COMMON) $(HDRS)
 	$(CC) $(CFLAGS) -o $@ src/host.c $(COMMON) $(LIBS)

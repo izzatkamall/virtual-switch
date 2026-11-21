@@ -193,6 +193,12 @@ static int evict_oldest(struct mac_table *t)
     return removed;
 }
 
+void mac_table_trim(struct mac_table *t)
+{
+    while (count_over(t) && evict_oldest(t))
+        ;
+}
+
 int mac_table_insert(struct mac_table *t, const uint8_t mac[MAC_LEN], int port)
 {
     // never learn the broadcast address

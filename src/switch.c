@@ -1,6 +1,6 @@
 // switch.c - the virtual switch
 //
-//   ./switch <tcp_port> <num_ports>
+//   ./switch <tcp_port> <num_ports> [config_file]
 //
 // every host that connects gets a port with two threads
 //   rx  reads frames, learns the source mac, puts the frame on the out queues
@@ -23,15 +23,12 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "config.h"
 #include "frame.h"
 #include "mac_table.h"
 #include "net_io.h"
 
 #define QUEUE_LEN 64  // frames waiting per port
-#define MAC_AGE_SECS 30  // forget a mac not seen for this long
-#define MAC_MAX_ENTRIES 1024  // biggest the mac table can get
-#define MAC_PER_PORT 16  // port security, more than this and the port is shut
-#define PORT_WAIT_SECS 5  // how long a new host waits for a free port
 #define DUMP_FILE "mac_dump.txt"  // SIGUSR1 writes the mac table here
 
 // one received frame, shared by every queue it goes into
@@ -91,6 +88,35 @@ static struct mac_table table;
 static sem_t free_ports;  // counts ports nobody is using
 static int listen_fd = -1;
 
+// settings from the config file, SIGHUP can change them while we run
+static pthread_mutex_t cfg_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct config cfg;
+static const char *cfg_path = NULL;
+
+static struct config get_config(void)
+{
+    pthread_mutex_lock(&cfg_lock);
+    struct config c = cfg;
+    pthread_mutex_unlock(&cfg_lock);
+    return c;
+}
+
+// loads the config file and puts the new values into use
+static int apply_config(void)
+{
+    struct config c = get_config();
+    if (cfg_path != NULL && config_load(cfg_path, &c) != 0)
+        return -1;
+
+    pthread_mutex_lock(&cfg_lock);
+    cfg = c;
+    pthread_mutex_unlock(&cfg_lock);
+
+    mac_table_set_limits(&table, c.mac_max, c.mac_per_port);
+    mac_table_trim(&table);  // in case mac_max got smaller
+    return 0;
+}
+
 // set when the switch is shutting down, the cond wakes sleeping threads
 static pthread_mutex_t stop_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t stop_cond = PTHREAD_COND_INITIALIZER;
@@ -123,7 +149,7 @@ static void port_enqueue(int p, struct pkt *k)
 static int forward(int in_port, const struct frame_header *h, const uint8_t *payload)
 {
     if (mac_table_insert(&table, h->src, in_port) == MAC_PORT_FULL) {
-        printf("port %d has more than %d macs, shutting it down\n", in_port, MAC_PER_PORT);
+        printf("port %d has more than %d macs, shutting it down\n", in_port, get_config().mac_per_port);
         fflush(stdout);
         return -1;
     }
@@ -322,6 +348,17 @@ static void *signal_thread(void *arg)
 
         if (sig == SIGUSR1) {
             dump_mac_table();
+        } else if (sig == SIGHUP) {
+            if (cfg_path == NULL) {
+                printf("got SIGHUP but there is no config file\n");
+            } else if (apply_config() == 0) {
+                struct config c = get_config();
+                printf("reloaded %s: mac_age %d mac_max %d mac_per_port %d port_wait %d\n",
+                       cfg_path, c.mac_age, c.mac_max, c.mac_per_port, c.port_wait);
+            } else {
+                printf("config has errors, keeping the old settings\n");
+            }
+            fflush(stdout);
         } else if (sig == SIGINT || sig == SIGTERM) {
             printf("\nshutting down\n");
             fflush(stdout);
@@ -382,7 +419,7 @@ static void *aging_thread(void *arg)
 {
     (void)arg;
     while (!wait_one_second()) {
-        int n = mac_table_age(&table, MAC_AGE_SECS * 1000);
+        int n = mac_table_age(&table, (uint64_t)get_config().mac_age * 1000);
         if (n > 0) {
             printf("aged out %d mac entries\n", n);
             fflush(stdout);
@@ -396,7 +433,7 @@ static int wait_for_port(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec += PORT_WAIT_SECS;
+    ts.tv_sec += get_config().port_wait;
 
     while (sem_timedwait(&free_ports, &ts) < 0) {
         if (errno != EINTR)
@@ -450,8 +487,8 @@ static int make_listen_socket(int tcp_port)
 
 int main(int argc, char *argv[])
 {
-    if (argc != 3) {
-        fprintf(stderr, "usage: %s <tcp_port> <num_ports>\n", argv[0]);
+    if (argc != 3 && argc != 4) {
+        fprintf(stderr, "usage: %s <tcp_port> <num_ports> [config_file]\n", argv[0]);
         return 1;
     }
     int tcp_port = atoi(argv[1]);
@@ -488,7 +525,14 @@ int main(int argc, char *argv[])
         fprintf(stderr, "mac_table_init failed\n");
         return 1;
     }
-    mac_table_set_limits(&table, MAC_MAX_ENTRIES, MAC_PER_PORT);
+    config_defaults(&cfg);
+    if (argc == 4)
+        cfg_path = argv[3];
+    if (apply_config() != 0) {
+        fprintf(stderr, "could not load config %s\n", cfg_path);
+        mac_table_destroy(&table);
+        return 1;
+    }
     for (int p = 0; p < num_ports; p++) {
         ports[p].id = p;
         ports[p].fd = -1;

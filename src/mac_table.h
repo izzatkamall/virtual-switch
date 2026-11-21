@@ -53,6 +53,9 @@ void mac_table_destroy(struct mac_table *t);
 // max_entries for the whole table, max_per_port for port security
 void mac_table_set_limits(struct mac_table *t, int max_entries, int max_per_port);
 
+// evicts oldest entries until the table fits max_entries again
+void mac_table_trim(struct mac_table *t);
+
 int mac_table_count(struct mac_table *t);
 int mac_table_port_count(struct mac_table *t, int port);
 
