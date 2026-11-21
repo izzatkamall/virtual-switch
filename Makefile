@@ -5,9 +5,13 @@ LIBS   = -pthread -lrt
 COMMON = src/frame.c src/net_io.c
 HDRS   = $(wildcard src/*.h)
 
+PROGS = host
 TESTS = test_frame_mac test_net_io
 
-all: $(TESTS)
+all: $(PROGS) $(TESTS)
+
+host: src/host.c $(COMMON) $(HDRS)
+	$(CC) $(CFLAGS) -o $@ src/host.c $(COMMON) $(LIBS)
 
 test_frame_mac: tests/test_frame_mac.c src/frame.c src/mac_table.c $(HDRS)
 	$(CC) $(CFLAGS) -o $@ tests/test_frame_mac.c src/frame.c src/mac_table.c $(LIBS)
@@ -25,6 +29,6 @@ tsan:
 	$(MAKE) CFLAGS="$(CFLAGS) -fsanitize=thread" test
 
 clean:
-	rm -f $(TESTS) switch host swctl
+	rm -f $(PROGS) $(TESTS)
 
 .PHONY: all test tsan clean
