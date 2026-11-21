@@ -2,6 +2,7 @@
 *.o
 test_frame_mac
 test_net_io
+test_qos
 
 
 switch

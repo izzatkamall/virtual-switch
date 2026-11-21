@@ -28,10 +28,11 @@
 #include "log.h"
 #include "mac_table.h"
 #include "net_io.h"
+#include "qos.h"
 
-#define QUEUE_LEN 64  // frames waiting per port
 #define DUMP_FILE "mac_dump.txt"  // SIGUSR1 writes the mac table here
 #define LOG_FILE "switch.log"
+#define SEND_BUF_SIZE 8192  // kernel send buffer per host, linux doubles it
 
 // one received frame, shared by every queue it goes into
 // refs counts how many queues still hold it, the last one frees it
@@ -77,10 +78,8 @@ struct port {
     pthread_t rx_tid;
     pthread_t tx_tid;
 
-    // ring buffer of frames to send out this port
-    struct pkt *queue[QUEUE_LEN];
-    int head;
-    int count;
+    // frames waiting to go out, one queue per priority
+    struct qos out;
     unsigned long dropped;
 };
 
@@ -135,14 +134,12 @@ static void port_enqueue(int p, struct pkt *k)
         pthread_mutex_unlock(&pt->lock);
         return;
     }
-    if (pt->count == QUEUE_LEN) {
-        pt->dropped++;
+    if (qos_push(&pt->out, k->h.priority, k, now_ms()) < 0) {
+        pt->dropped++;  // that priority queue is full
         pthread_mutex_unlock(&pt->lock);
         return;
     }
     pkt_get(k);  // the queue holds a reference now
-    pt->queue[(pt->head + pt->count) % QUEUE_LEN] = k;
-    pt->count++;
     pthread_cond_signal(&pt->not_empty);
     pthread_mutex_unlock(&pt->lock);
 }
@@ -191,15 +188,14 @@ static void *tx_thread(void *arg)
 
     while (1) {
         pthread_mutex_lock(&pt->lock);
-        while (pt->count == 0 && pt->state == PORT_UP)
+        while (qos_count(&pt->out) == 0 && pt->state == PORT_UP)
             pthread_cond_wait(&pt->not_empty, &pt->lock);
         if (pt->state != PORT_UP) {
             pthread_mutex_unlock(&pt->lock);
             break;
         }
-        struct pkt *k = pt->queue[pt->head];
-        pt->head = (pt->head + 1) % QUEUE_LEN;
-        pt->count--;
+        // weighted round robin picks which priority goes next
+        struct pkt *k = qos_pop(&pt->out, now_ms());
         pthread_mutex_unlock(&pt->lock);
 
         int rc = frame_write(fd, &k->h, k->payload);
@@ -238,11 +234,9 @@ static void *rx_thread(void *arg)
 
     // both threads are done with the fd now
     pthread_mutex_lock(&pt->lock);
-    while (pt->count > 0) {
-        pkt_put(pt->queue[pt->head]);
-        pt->head = (pt->head + 1) % QUEUE_LEN;
-        pt->count--;
-    }
+    struct pkt *left;
+    while ((left = qos_pop(&pt->out, now_ms())) != NULL)
+        pkt_put(left);
     unsigned long dropped = pt->dropped;
     close(pt->fd);
     pt->fd = -1;
@@ -276,8 +270,7 @@ static int attach_host(int fd)
         pthread_mutex_lock(&pt->lock);
         pt->fd = fd;
         pt->state = PORT_UP;
-        pt->head = 0;
-        pt->count = 0;
+        qos_init(&pt->out);
         pt->dropped = 0;
         pthread_mutex_unlock(&pt->lock);
 
@@ -590,6 +583,12 @@ int main(int argc, char *argv[])
             close(fd);
             continue;
         }
+
+        // small kernel buffer so frames wait in our own priority queues,
+        // with the default few MB the kernel would send everything in order
+        int sndbuf = SEND_BUF_SIZE;
+        if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) < 0)
+            log_msg("setsockopt SO_SNDBUF: %s", strerror(errno));
 
         int p = attach_host(fd);
         if (p < 0) {
