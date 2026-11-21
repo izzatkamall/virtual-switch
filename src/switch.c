@@ -88,6 +88,7 @@ static struct port ports[MAX_PORTS];
 static int num_ports;
 static struct mac_table table;
 static sem_t free_ports;  // counts ports nobody is using
+static int listen_fd = -1;
 
 // set when the switch is shutting down, the cond wakes sleeping threads
 static pthread_mutex_t stop_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -276,6 +277,65 @@ static int attach_host(int fd)
     return -1;
 }
 
+static int is_stopping(void)
+{
+    pthread_mutex_lock(&stop_lock);
+    int s = stopping;
+    pthread_mutex_unlock(&stop_lock);
+    return s;
+}
+
+// the only thread that gets SIGINT, SIGHUP and SIGUSR1
+// every other thread has them blocked
+static void *signal_thread(void *arg)
+{
+    sigset_t *set = arg;
+
+    while (1) {
+        int sig;
+        if (sigwait(set, &sig) != 0) {
+            fprintf(stderr, "sigwait failed\n");
+            continue;
+        }
+
+        if (sig == SIGINT || sig == SIGTERM) {
+            printf("\nshutting down\n");
+            fflush(stdout);
+
+            pthread_mutex_lock(&stop_lock);
+            stopping = 1;
+            pthread_cond_broadcast(&stop_cond);  // wakes the aging thread
+            pthread_mutex_unlock(&stop_lock);
+
+            // wake main if its stuck in accept or waiting for a port
+            shutdown(listen_fd, SHUT_RDWR);
+            sem_post(&free_ports);
+            break;
+        }
+    }
+    return NULL;
+}
+
+// kicks every host off, the rx threads then clean up like a normal disconnect
+// only main calls this, after it stopped accepting, so no new port can show up
+static void close_all_ports(void)
+{
+    for (int p = 0; p < num_ports; p++) {
+        struct port *pt = &ports[p];
+        pthread_mutex_lock(&pt->lock);
+        if (pt->state == PORT_UP)
+            shutdown(pt->fd, SHUT_RDWR);
+        int started = pt->state != PORT_FREE;
+        pthread_mutex_unlock(&pt->lock);
+
+        // every port that isnt FREE has an rx thread nobody joined yet
+        if (started) {
+            pthread_join(pt->rx_tid, NULL);
+            pt->state = PORT_FREE;
+        }
+    }
+}
+
 // waits about one second, returns 1 if we should stop
 static int wait_one_second(void)
 {
@@ -381,6 +441,19 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    // block these before any thread starts so every thread inherits it,
+    // then only the signal thread sees them through sigwait
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGINT);
+    sigaddset(&set, SIGTERM);
+    sigaddset(&set, SIGHUP);
+    sigaddset(&set, SIGUSR1);
+    if (pthread_sigmask(SIG_BLOCK, &set, NULL) != 0) {
+        fprintf(stderr, "pthread_sigmask failed\n");
+        return 1;
+    }
+
     // a host leaving should give us EPIPE, not kill the switch
     if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
         perror("signal");
@@ -408,9 +481,15 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    int listen_fd = make_listen_socket(tcp_port);
+    listen_fd = make_listen_socket(tcp_port);
     if (listen_fd < 0)
         return 1;
+
+    pthread_t sig_tid;
+    if (pthread_create(&sig_tid, NULL, signal_thread, &set) != 0) {
+        fprintf(stderr, "could not start signal thread\n");
+        return 1;
+    }
 
     pthread_t aging_tid;
     if (pthread_create(&aging_tid, NULL, aging_thread, NULL) != 0) {
@@ -421,9 +500,11 @@ int main(int argc, char *argv[])
     printf("switch listening on port %d with %d ports\n", tcp_port, num_ports);
     fflush(stdout);
 
-    while (1) {
+    while (!is_stopping()) {
         int fd = accept(listen_fd, NULL, NULL);
         if (fd < 0) {
+            if (is_stopping())
+                break;
             if (errno == EINTR)
                 continue;
             perror("accept");
@@ -431,7 +512,12 @@ int main(int argc, char *argv[])
         }
 
         // all ports busy, wait a bit for one to free up
-        if (wait_for_port() < 0) {
+        int got_port = wait_for_port();
+        if (is_stopping()) {
+            close(fd);
+            break;
+        }
+        if (got_port < 0) {
             printf("switch full, sending a new host away\n");
             fflush(stdout);
             send_switch_full(fd);
@@ -450,8 +536,27 @@ int main(int argc, char *argv[])
         fflush(stdout);
     }
 
+    // if accept failed for some other reason, still shut down properly
+    pthread_mutex_lock(&stop_lock);
+    stopping = 1;
+    pthread_cond_broadcast(&stop_cond);
+    pthread_mutex_unlock(&stop_lock);
+
+    close_all_ports();
+    pthread_join(aging_tid, NULL);
+
+    // signal thread might still be in sigwait if we got here without SIGINT
+    pthread_kill(sig_tid, SIGINT);
+    pthread_join(sig_tid, NULL);
+
+    // nothing else is running now, free everything
     close(listen_fd);
+    for (int p = 0; p < num_ports; p++) {
+        pthread_mutex_destroy(&ports[p].lock);
+        pthread_cond_destroy(&ports[p].not_empty);
+    }
     sem_destroy(&free_ports);
     mac_table_destroy(&table);
+    printf("switch stopped cleanly\n");
     return 0;
 }
