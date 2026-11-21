@@ -7,6 +7,7 @@ test_net_io
 switch
 host
 swctl
+mac_dump.txt
 
 # not part of this project
 BSAI24078_Lab9/

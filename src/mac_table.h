@@ -67,6 +67,9 @@ int mac_table_age(struct mac_table *t, uint64_t max_age_ms);
 // removes every mac learned on a port, used when its host leaves
 int mac_table_remove_port(struct mac_table *t, int port);
 
+// returns the table as text (malloced, caller frees) or NULL on error
+char *mac_table_to_string(struct mac_table *t);
+
 // ms since some fixed point, only good for measuring gaps
 uint64_t now_ms(void);
 

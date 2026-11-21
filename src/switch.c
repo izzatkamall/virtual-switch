@@ -32,6 +32,7 @@
 #define MAC_MAX_ENTRIES 1024  // biggest the mac table can get
 #define MAC_PER_PORT 16  // port security, more than this and the port is shut
 #define PORT_WAIT_SECS 5  // how long a new host waits for a free port
+#define DUMP_FILE "mac_dump.txt"  // SIGUSR1 writes the mac table here
 
 // one received frame, shared by every queue it goes into
 // refs counts how many queues still hold it, the last one frees it
@@ -285,6 +286,27 @@ static int is_stopping(void)
     return s;
 }
 
+static void dump_mac_table(void)
+{
+    char *text = mac_table_to_string(&table);
+    if (text == NULL) {
+        fprintf(stderr, "could not build mac table dump\n");
+        return;
+    }
+    FILE *f = fopen(DUMP_FILE, "w");
+    if (f == NULL) {
+        perror("fopen " DUMP_FILE);
+        free(text);
+        return;
+    }
+    fputs(text, f);
+    if (fclose(f) != 0)
+        perror("fclose");
+    free(text);
+    printf("mac table dumped to %s\n", DUMP_FILE);
+    fflush(stdout);
+}
+
 // the only thread that gets SIGINT, SIGHUP and SIGUSR1
 // every other thread has them blocked
 static void *signal_thread(void *arg)
@@ -298,7 +320,9 @@ static void *signal_thread(void *arg)
             continue;
         }
 
-        if (sig == SIGINT || sig == SIGTERM) {
+        if (sig == SIGUSR1) {
+            dump_mac_table();
+        } else if (sig == SIGINT || sig == SIGTERM) {
             printf("\nshutting down\n");
             fflush(stdout);
 

@@ -320,3 +320,38 @@ int mac_table_remove_port(struct mac_table *t, int port)
 {
     return remove_if(t, on_port, (uint64_t)port);
 }
+
+char *mac_table_to_string(struct mac_table *t)
+{
+    char *buf = NULL;
+    size_t size = 0;
+    int n = 0;
+
+    // memstream is just memory so its fine to write to it while locked
+    FILE *out = open_memstream(&buf, &size);
+    if (out == NULL)
+        return NULL;
+
+    fprintf(out, "%-18s %-5s %s\n", "MAC", "PORT", "AGE(s)");
+    uint64_t now = now_ms();
+
+    // one bucket at a time so we never block the whole table
+    for (int i = 0; i < MAC_TABLE_BUCKETS; i++) {
+        pthread_mutex_lock(&t->buckets[i].lock);
+        for (struct mac_entry *e = t->buckets[i].head; e != NULL; e = e->next) {
+            char s[MAC_STR_LEN];
+            mac_to_string(e->mac, s);
+            fprintf(out, "%-18s %-5d %llu\n", s, e->port,
+                    (unsigned long long)((now - e->last_seen) / 1000));
+            n++;
+        }
+        pthread_mutex_unlock(&t->buckets[i].lock);
+    }
+    fprintf(out, "%d entries\n", n);
+
+    if (fclose(out) != 0) {
+        free(buf);
+        return NULL;
+    }
+    return buf;
+}

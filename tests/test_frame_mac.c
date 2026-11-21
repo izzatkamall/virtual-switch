@@ -81,6 +81,12 @@ static void test_mac_basic(void)
     CHECK(mac_table_lookup(&t, a) == 7);
     CHECK(mac_table_insert(&t, MAC_BROADCAST, 1) == MAC_ERROR);
 
+    char *text = mac_table_to_string(&t);
+    CHECK(text != NULL);
+    CHECK(text != NULL && strstr(text, "00:00:00:00:00:01  7") != NULL);
+    CHECK(text != NULL && strstr(text, "2 entries") != NULL);
+    free(text);
+
     mac_table_destroy(&t);
 }
 
