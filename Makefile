@@ -2,7 +2,7 @@ CC     = gcc
 CFLAGS = -std=c11 -Wall -Wextra -Werror -g -O0
 LIBS   = -pthread -lrt
 
-COMMON = src/frame.c src/net_io.c
+COMMON = src/frame.c src/net_io.c src/log.c
 HDRS   = $(wildcard src/*.h)
 
 PROGS = switch host
@@ -16,8 +16,8 @@ switch: src/switch.c src/mac_table.c src/config.c $(COMMON) $(HDRS)
 host: src/host.c $(COMMON) $(HDRS)
 	$(CC) $(CFLAGS) -o $@ src/host.c $(COMMON) $(LIBS)
 
-test_frame_mac: tests/test_frame_mac.c src/frame.c src/mac_table.c $(HDRS)
-	$(CC) $(CFLAGS) -o $@ tests/test_frame_mac.c src/frame.c src/mac_table.c $(LIBS)
+test_frame_mac: tests/test_frame_mac.c src/mac_table.c $(COMMON) $(HDRS)
+	$(CC) $(CFLAGS) -o $@ tests/test_frame_mac.c src/mac_table.c $(COMMON) $(LIBS)
 
 test_net_io: tests/test_net_io.c $(COMMON) $(HDRS)
 	$(CC) $(CFLAGS) -o $@ tests/test_net_io.c $(COMMON) $(LIBS)

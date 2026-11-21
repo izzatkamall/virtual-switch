@@ -8,6 +8,7 @@ switch
 host
 swctl
 mac_dump.txt
+switch.log
 
 # not part of this project
 BSAI24078_Lab9/

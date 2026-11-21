@@ -25,11 +25,13 @@
 
 #include "config.h"
 #include "frame.h"
+#include "log.h"
 #include "mac_table.h"
 #include "net_io.h"
 
 #define QUEUE_LEN 64  // frames waiting per port
 #define DUMP_FILE "mac_dump.txt"  // SIGUSR1 writes the mac table here
+#define LOG_FILE "switch.log"
 
 // one received frame, shared by every queue it goes into
 // refs counts how many queues still hold it, the last one frees it
@@ -149,8 +151,7 @@ static void port_enqueue(int p, struct pkt *k)
 static int forward(int in_port, const struct frame_header *h, const uint8_t *payload)
 {
     if (mac_table_insert(&table, h->src, in_port) == MAC_PORT_FULL) {
-        printf("port %d has more than %d macs, shutting it down\n", in_port, get_config().mac_per_port);
-        fflush(stdout);
+        log_msg("port %d has more than %d macs, shutting it down", in_port, get_config().mac_per_port);
         return -1;
     }
 
@@ -251,8 +252,7 @@ static void *rx_thread(void *arg)
     // one more port free, wakes up a host waiting in main
     sem_post(&free_ports);
 
-    printf("port %d disconnected (%lu frames dropped)\n", pt->id, dropped);
-    fflush(stdout);
+    log_msg("port %d disconnected (%lu frames dropped)", pt->id, dropped);
     return NULL;
 }
 
@@ -316,21 +316,20 @@ static void dump_mac_table(void)
 {
     char *text = mac_table_to_string(&table);
     if (text == NULL) {
-        fprintf(stderr, "could not build mac table dump\n");
+        log_msg("could not build mac table dump");
         return;
     }
     FILE *f = fopen(DUMP_FILE, "w");
     if (f == NULL) {
-        perror("fopen " DUMP_FILE);
+        log_msg("fopen %s: %s", DUMP_FILE, strerror(errno));
         free(text);
         return;
     }
     fputs(text, f);
     if (fclose(f) != 0)
-        perror("fclose");
+        log_msg("fclose %s: %s", DUMP_FILE, strerror(errno));
     free(text);
-    printf("mac table dumped to %s\n", DUMP_FILE);
-    fflush(stdout);
+    log_msg("mac table dumped to %s", DUMP_FILE);
 }
 
 // the only thread that gets SIGINT, SIGHUP and SIGUSR1
@@ -342,7 +341,7 @@ static void *signal_thread(void *arg)
     while (1) {
         int sig;
         if (sigwait(set, &sig) != 0) {
-            fprintf(stderr, "sigwait failed\n");
+            log_msg("sigwait failed");
             continue;
         }
 
@@ -350,18 +349,16 @@ static void *signal_thread(void *arg)
             dump_mac_table();
         } else if (sig == SIGHUP) {
             if (cfg_path == NULL) {
-                printf("got SIGHUP but there is no config file\n");
+                log_msg("got SIGHUP but there is no config file");
             } else if (apply_config() == 0) {
                 struct config c = get_config();
-                printf("reloaded %s: mac_age %d mac_max %d mac_per_port %d port_wait %d\n",
+                log_msg("reloaded %s: mac_age %d mac_max %d mac_per_port %d port_wait %d",
                        cfg_path, c.mac_age, c.mac_max, c.mac_per_port, c.port_wait);
             } else {
-                printf("config has errors, keeping the old settings\n");
+                log_msg("config has errors, keeping the old settings");
             }
-            fflush(stdout);
         } else if (sig == SIGINT || sig == SIGTERM) {
-            printf("\nshutting down\n");
-            fflush(stdout);
+            log_msg("shutting down");
 
             pthread_mutex_lock(&stop_lock);
             stopping = 1;
@@ -421,8 +418,7 @@ static void *aging_thread(void *arg)
     while (!wait_one_second()) {
         int n = mac_table_age(&table, (uint64_t)get_config().mac_age * 1000);
         if (n > 0) {
-            printf("aged out %d mac entries\n", n);
-            fflush(stdout);
+            log_msg("aged out %d mac entries", n);
         }
     }
     return NULL;
@@ -515,6 +511,10 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    // logger thread, started after the mask so it doesnt get signals either
+    if (log_start(LOG_FILE) != 0)
+        return 1;
+
     // a host leaving should give us EPIPE, not kill the switch
     if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
         perror("signal");
@@ -565,8 +565,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    printf("switch listening on port %d with %d ports\n", tcp_port, num_ports);
-    fflush(stdout);
+    log_msg("switch listening on port %d with %d ports", tcp_port, num_ports);
 
     while (!is_stopping()) {
         int fd = accept(listen_fd, NULL, NULL);
@@ -575,7 +574,7 @@ int main(int argc, char *argv[])
                 break;
             if (errno == EINTR)
                 continue;
-            perror("accept");
+            log_msg("accept: %s", strerror(errno));
             break;
         }
 
@@ -586,8 +585,7 @@ int main(int argc, char *argv[])
             break;
         }
         if (got_port < 0) {
-            printf("switch full, sending a new host away\n");
-            fflush(stdout);
+            log_msg("switch full, sending a new host away");
             send_switch_full(fd);
             close(fd);
             continue;
@@ -595,13 +593,12 @@ int main(int argc, char *argv[])
 
         int p = attach_host(fd);
         if (p < 0) {
-            printf("could not attach host\n");
+            log_msg("could not attach host");
             sem_post(&free_ports);  // give the slot back
             close(fd);
         } else {
-            printf("host connected on port %d\n", p);
+            log_msg("host connected on port %d", p);
         }
-        fflush(stdout);
     }
 
     // if accept failed for some other reason, still shut down properly
@@ -625,6 +622,7 @@ int main(int argc, char *argv[])
     }
     sem_destroy(&free_ports);
     mac_table_destroy(&table);
-    printf("switch stopped cleanly\n");
+    log_msg("switch stopped cleanly");
+    log_stop();
     return 0;
 }

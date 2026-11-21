@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "mac_table.h"
+#include "log.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -188,7 +189,7 @@ static int evict_oldest(struct mac_table *t)
     if (removed) {
         char s[MAC_STR_LEN];
         mac_to_string(old_mac, s);
-        fprintf(stderr, "MAC table full, evicted %s\n", s);
+        log_msg("MAC table full, evicted %s", s);
     }
     return removed;
 }
@@ -260,7 +261,7 @@ int mac_table_insert(struct mac_table *t, const uint8_t mac[MAC_LEN], int port)
     if (result == MAC_MOVED) {
         char s[MAC_STR_LEN];
         mac_to_string(mac, s);
-        fprintf(stderr, "MAC moved: port %d -> port %d (%s)\n", old_port, port, s);
+        log_msg("MAC moved: port %d -> port %d (%s)", old_port, port, s);
     }
     return result;
 }

@@ -1,8 +1,10 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "config.h"
+#include "log.h"
 
 #include <stdio.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -29,7 +31,7 @@ int config_load(const char *path, struct config *c)
 {
     FILE *f = fopen(path, "r");
     if (f == NULL) {
-        perror(path);
+        log_msg("%s: %s", path, strerror(errno));
         return -1;
     }
 
@@ -48,7 +50,7 @@ int config_load(const char *path, struct config *c)
         if (n <= 0)
             continue;  // empty line
         if (n != 2) {
-            fprintf(stderr, "%s:%d: expected 'key value'\n", path, lineno);
+            log_msg("%s:%d: expected 'key value'", path, lineno);
             bad = 1;
             continue;
         }
@@ -63,18 +65,18 @@ int config_load(const char *path, struct config *c)
         else if (strcmp(key, "port_wait") == 0)
             rc = parse_int(val, 0, 3600, &tmp.port_wait);
         else {
-            fprintf(stderr, "%s:%d: unknown key %s\n", path, lineno, key);
+            log_msg("%s:%d: unknown key %s", path, lineno, key);
             bad = 1;
             continue;
         }
         if (rc < 0) {
-            fprintf(stderr, "%s:%d: bad value %s for %s\n", path, lineno, val, key);
+            log_msg("%s:%d: bad value %s for %s", path, lineno, val, key);
             bad = 1;
         }
     }
 
     if (ferror(f)) {
-        perror(path);
+        log_msg("%s: read error", path);
         bad = 1;
     }
     fclose(f);
