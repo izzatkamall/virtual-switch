@@ -1,8 +1,9 @@
 # build output
 *.o
 test_frame_mac
-test_frame_mac_tsan
-test_frame_mac_asan
+test_net_io
+
+
 switch
 host
 swctl

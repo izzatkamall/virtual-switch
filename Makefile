@@ -1,35 +1,30 @@
-CC      := gcc
-CFLAGS  := -std=c11 -Wall -Wextra -Werror -g -O0
-LDLIBS  := -pthread
+CC     = gcc
+CFLAGS = -std=c11 -Wall -Wextra -Werror -g -O0
+LIBS   = -pthread -lrt
 
-SRC_DIR := src
-TEST_DIR := tests
+COMMON = src/frame.c src/net_io.c
+HDRS   = $(wildcard src/*.h)
 
-CORE_SRCS := $(SRC_DIR)/frame.c $(SRC_DIR)/mac_table.c
-CORE_HDRS := $(SRC_DIR)/frame.h $(SRC_DIR)/mac_table.h
+TESTS = test_frame_mac test_net_io
 
-# Programs (switch, host, swctl) get added here as they are written.
-PROGRAMS := test_frame_mac
+all: $(TESTS)
 
-.PHONY: all clean test tsan asan
+test_frame_mac: tests/test_frame_mac.c src/frame.c src/mac_table.c $(HDRS)
+	$(CC) $(CFLAGS) -o $@ tests/test_frame_mac.c src/frame.c src/mac_table.c $(LIBS)
 
-all: $(PROGRAMS)
+test_net_io: tests/test_net_io.c $(COMMON) $(HDRS)
+	$(CC) $(CFLAGS) -o $@ tests/test_net_io.c $(COMMON) $(LIBS)
 
-test_frame_mac: $(TEST_DIR)/test_frame_mac.c $(CORE_SRCS) $(CORE_HDRS)
-	$(CC) $(CFLAGS) -o $@ $(TEST_DIR)/test_frame_mac.c $(CORE_SRCS) $(LDLIBS)
-
-test: test_frame_mac
+test: $(TESTS)
 	./test_frame_mac
+	./test_net_io
 
-# ThreadSanitizer build of the tests
-tsan: $(TEST_DIR)/test_frame_mac.c $(CORE_SRCS) $(CORE_HDRS)
-	$(CC) $(CFLAGS) -fsanitize=thread -o test_frame_mac_tsan $(TEST_DIR)/test_frame_mac.c $(CORE_SRCS) $(LDLIBS)
-	./test_frame_mac_tsan
-
-# AddressSanitizer + leak check (stand-in when valgrind isn't installed)
-asan: $(TEST_DIR)/test_frame_mac.c $(CORE_SRCS) $(CORE_HDRS)
-	$(CC) $(CFLAGS) -fsanitize=address,undefined -o test_frame_mac_asan $(TEST_DIR)/test_frame_mac.c $(CORE_SRCS) $(LDLIBS)
-	./test_frame_mac_asan
+# needs libtsan installed
+tsan:
+	$(MAKE) clean
+	$(MAKE) CFLAGS="$(CFLAGS) -fsanitize=thread" test
 
 clean:
-	rm -f $(PROGRAMS) test_frame_mac_tsan test_frame_mac_asan
+	rm -f $(TESTS) switch host swctl
+
+.PHONY: all test tsan clean
