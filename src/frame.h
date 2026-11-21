@@ -24,6 +24,8 @@
 #define VLAN_MIN 1
 #define VLAN_MAX 4094
 
+#define MAX_PORTS 64  // most ports a switch can have
+
 #define MAC_STR_LEN 18  // "AA:BB:CC:DD:EE:FF" plus the null
 
 enum {

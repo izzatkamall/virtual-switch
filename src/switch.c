@@ -26,10 +26,10 @@
 #include "mac_table.h"
 #include "net_io.h"
 
-#define MAX_PORTS 64
 #define QUEUE_LEN 64  // frames waiting per port
 #define MAC_AGE_SECS 30  // forget a mac not seen for this long
 #define MAC_MAX_ENTRIES 1024  // biggest the mac table can get
+#define MAC_PER_PORT 16  // port security, more than this and the port is shut
 
 // one received frame, shared by every queue it goes into
 // refs counts how many queues still hold it, the last one frees it
@@ -114,21 +114,26 @@ static void port_enqueue(int p, struct pkt *k)
     pthread_mutex_unlock(&pt->lock);
 }
 
-static void forward(int in_port, const struct frame_header *h, const uint8_t *payload)
+// returns -1 if the port broke port security and has to be shut
+static int forward(int in_port, const struct frame_header *h, const uint8_t *payload)
 {
-    mac_table_insert(&table, h->src, in_port);
+    if (mac_table_insert(&table, h->src, in_port) == MAC_PORT_FULL) {
+        printf("port %d has more than %d macs, shutting it down\n", in_port, MAC_PER_PORT);
+        fflush(stdout);
+        return -1;
+    }
 
     int out = -1;
     if (!mac_is_broadcast(h->dst))
         out = mac_table_lookup(&table, h->dst);
 
     if (out == in_port)
-        return;  // dest is on the same port, nothing to do
+        return 0;  // dest is on the same port, nothing to do
 
     // one copy no matter how many ports it goes to
     struct pkt *k = pkt_new(h, payload);
     if (k == NULL)
-        return;
+        return 0;
 
     if (out >= 0) {
         port_enqueue(out, k);
@@ -142,6 +147,7 @@ static void forward(int in_port, const struct frame_header *h, const uint8_t *pa
 
     // let go of our own reference, frees it if no queue took it
     pkt_put(k);
+    return 0;
 }
 
 // takes frames off the queue and writes them to the host
@@ -182,8 +188,13 @@ static void *rx_thread(void *arg)
     uint8_t payload[FRAME_MAX_PAYLOAD];
     int fd = pt->fd;
 
-    while (frame_read(fd, &h, payload) == 1)
-        forward(pt->id, &h, payload);
+    while (frame_read(fd, &h, payload) == 1) {
+        if (forward(pt->id, &h, payload) < 0)
+            break;
+    }
+
+    // forget the macs on this port so a new host starts clean
+    mac_table_remove_port(&table, pt->id);
 
     // stop the sender, shutdown wakes it if its stuck in write()
     pthread_mutex_lock(&pt->lock);
@@ -348,7 +359,7 @@ int main(int argc, char *argv[])
         fprintf(stderr, "mac_table_init failed\n");
         return 1;
     }
-    mac_table_set_max(&table, MAC_MAX_ENTRIES);
+    mac_table_set_limits(&table, MAC_MAX_ENTRIES, MAC_PER_PORT);
     for (int p = 0; p < num_ports; p++) {
         ports[p].id = p;
         ports[p].fd = -1;

@@ -33,11 +33,51 @@ static struct mac_entry *find_in_bucket(struct mac_bucket *b, const uint8_t mac[
     return NULL;
 }
 
-// changes the entry count by d, returns 1 if we are now over the limit
-static int count_add(struct mac_table *t, int d)
+// counter helpers, all of them only take count_lock
+
+// a new mac on port, returns -1 if the port is full,
+// 1 if the table is now over its limit, 0 otherwise
+static int count_new(struct mac_table *t, int port)
+{
+    int rc;
+    pthread_mutex_lock(&t->count_lock);
+    if (t->per_port[port] >= t->max_per_port) {
+        rc = -1;
+    } else {
+        t->per_port[port]++;
+        t->count++;
+        rc = t->count > t->max_entries;
+    }
+    pthread_mutex_unlock(&t->count_lock);
+    return rc;
+}
+
+// a mac moving ports, returns -1 if the new port is full
+static int count_move(struct mac_table *t, int from, int to)
+{
+    int rc = 0;
+    pthread_mutex_lock(&t->count_lock);
+    if (t->per_port[to] >= t->max_per_port) {
+        rc = -1;
+    } else {
+        t->per_port[from]--;
+        t->per_port[to]++;
+    }
+    pthread_mutex_unlock(&t->count_lock);
+    return rc;
+}
+
+static void count_removed(struct mac_table *t, int port)
 {
     pthread_mutex_lock(&t->count_lock);
-    t->count += d;
+    t->per_port[port]--;
+    t->count--;
+    pthread_mutex_unlock(&t->count_lock);
+}
+
+static int count_over(struct mac_table *t)
+{
+    pthread_mutex_lock(&t->count_lock);
     int over = t->count > t->max_entries;
     pthread_mutex_unlock(&t->count_lock);
     return over;
@@ -51,17 +91,30 @@ int mac_table_count(struct mac_table *t)
     return n;
 }
 
-void mac_table_set_max(struct mac_table *t, int max_entries)
+int mac_table_port_count(struct mac_table *t, int port)
+{
+    if (port < 0 || port >= MAX_PORTS)
+        return 0;
+    pthread_mutex_lock(&t->count_lock);
+    int n = t->per_port[port];
+    pthread_mutex_unlock(&t->count_lock);
+    return n;
+}
+
+void mac_table_set_limits(struct mac_table *t, int max_entries, int max_per_port)
 {
     pthread_mutex_lock(&t->count_lock);
     t->max_entries = max_entries;
+    t->max_per_port = max_per_port;
     pthread_mutex_unlock(&t->count_lock);
 }
 
 int mac_table_init(struct mac_table *t)
 {
+    memset(t->per_port, 0, sizeof(t->per_port));
     t->count = 0;
     t->max_entries = MAC_TABLE_DEFAULT_MAX;
+    t->max_per_port = MAC_TABLE_DEFAULT_MAX;
     if (pthread_mutex_init(&t->count_lock, NULL) != 0)
         return -1;
 
@@ -91,7 +144,6 @@ void mac_table_destroy(struct mac_table *t)
         t->buckets[i].head = NULL;
         pthread_mutex_destroy(&t->buckets[i].lock);
     }
-    t->count = 0;
     pthread_mutex_destroy(&t->count_lock);
 }
 
@@ -125,6 +177,7 @@ static int evict_oldest(struct mac_table *t)
         struct mac_entry *e = *link;
         if (mac_equal(e->mac, old_mac) && e->last_seen == old_time) {
             *link = e->next;
+            count_removed(t, e->port);
             free(e);
             removed = 1;
             break;
@@ -133,7 +186,6 @@ static int evict_oldest(struct mac_table *t)
     pthread_mutex_unlock(&b->lock);
 
     if (removed) {
-        count_add(t, -1);
         char s[MAC_STR_LEN];
         mac_to_string(old_mac, s);
         fprintf(stderr, "MAC table full, evicted %s\n", s);
@@ -144,42 +196,50 @@ static int evict_oldest(struct mac_table *t)
 int mac_table_insert(struct mac_table *t, const uint8_t mac[MAC_LEN], int port)
 {
     // never learn the broadcast address
-    if (mac_is_broadcast(mac) || port < 0)
+    if (mac_is_broadcast(mac) || port < 0 || port >= MAX_PORTS)
         return MAC_ERROR;
 
     struct mac_bucket *b = &t->buckets[hash_mac(mac)];
     int result;
     int old_port = -1;
+    int over = 0;
 
     pthread_mutex_lock(&b->lock);
 
     struct mac_entry *e = find_in_bucket(b, mac);
-    if (e != NULL) {
-        if (e->port != port) {
+    if (e != NULL && e->port == port) {
+        e->last_seen = now_ms();
+        result = MAC_SAME;
+    } else if (e != NULL) {
+        if (count_move(t, e->port, port) < 0) {
+            result = MAC_PORT_FULL;
+        } else {
             old_port = e->port;
             e->port = port;
-            result = MAC_MOVED;
-        } else {
-            result = MAC_SAME;
-        }
-        e->last_seen = now_ms();
-    } else {
-        e = malloc(sizeof(*e));
-        if (e == NULL) {
-            result = MAC_ERROR;
-        } else {
-            memcpy(e->mac, mac, MAC_LEN);
-            e->port = port;
             e->last_seen = now_ms();
-            e->next = b->head;
-            b->head = e;
-            result = MAC_NEW;
+            result = MAC_MOVED;
+        }
+    } else {
+        over = count_new(t, port);
+        if (over < 0) {
+            over = 0;
+            result = MAC_PORT_FULL;
+        } else {
+            e = malloc(sizeof(*e));
+            if (e == NULL) {
+                count_removed(t, port);  // undo
+                over = 0;
+                result = MAC_ERROR;
+            } else {
+                memcpy(e->mac, mac, MAC_LEN);
+                e->port = port;
+                e->last_seen = now_ms();
+                e->next = b->head;
+                b->head = e;
+                result = MAC_NEW;
+            }
         }
     }
-
-    int over = 0;
-    if (result == MAC_NEW)
-        over = count_add(t, 1);
 
     pthread_mutex_unlock(&b->lock);
 
@@ -187,7 +247,7 @@ int mac_table_insert(struct mac_table *t, const uint8_t mac[MAC_LEN], int port)
     // done after unlocking because evict needs other bucket locks
     while (over) {
         evict_oldest(t);
-        over = count_add(t, 0);
+        over = count_over(t);
     }
 
     // print after unlocking so we dont hold the lock while doing io
@@ -213,10 +273,10 @@ int mac_table_lookup(struct mac_table *t, const uint8_t mac[MAC_LEN])
     return port;
 }
 
-int mac_table_age(struct mac_table *t, uint64_t max_age_ms)
+// removes entries where old(e) is true, used by aging and port flush
+static int remove_if(struct mac_table *t, int (*old)(struct mac_entry *, uint64_t), uint64_t arg)
 {
     int removed = 0;
-    uint64_t now = now_ms();
 
     // one bucket at a time so forwarding keeps going in the others
     for (int i = 0; i < MAC_TABLE_BUCKETS; i++) {
@@ -227,11 +287,11 @@ int mac_table_age(struct mac_table *t, uint64_t max_age_ms)
         struct mac_entry **link = &b->head;
         while (*link != NULL) {
             struct mac_entry *e = *link;
-            if (now - e->last_seen > max_age_ms) {
+            if (old(e, arg)) {
                 *link = e->next;
+                count_removed(t, e->port);
                 free(e);
                 removed++;
-                count_add(t, -1);
             } else {
                 link = &e->next;
             }
@@ -239,4 +299,24 @@ int mac_table_age(struct mac_table *t, uint64_t max_age_ms)
         pthread_mutex_unlock(&b->lock);
     }
     return removed;
+}
+
+static int too_old(struct mac_entry *e, uint64_t max_age_ms)
+{
+    return now_ms() - e->last_seen > max_age_ms;
+}
+
+static int on_port(struct mac_entry *e, uint64_t port)
+{
+    return (uint64_t)e->port == port;
+}
+
+int mac_table_age(struct mac_table *t, uint64_t max_age_ms)
+{
+    return remove_if(t, too_old, max_age_ms);
+}
+
+int mac_table_remove_port(struct mac_table *t, int port)
+{
+    return remove_if(t, on_port, (uint64_t)port);
 }

@@ -98,7 +98,7 @@ static void test_mac_lru(void)
 {
     struct mac_table t;
     CHECK(mac_table_init(&t) == 0);
-    mac_table_set_max(&t, 3);
+    mac_table_set_limits(&t, 3, 100);
     struct timespec wait = {0, 5 * 1000000};  // 5ms so timestamps differ
 
     uint8_t m[5][MAC_LEN];
@@ -128,6 +128,41 @@ static void test_mac_lru(void)
     mac_table_insert(&t, m[4], 4);  // now m2 is oldest
     CHECK(mac_table_lookup(&t, m[2]) == -1);
     CHECK(mac_table_count(&t) == 3);
+
+    mac_table_destroy(&t);
+}
+
+static void test_mac_port_security(void)
+{
+    struct mac_table t;
+    CHECK(mac_table_init(&t) == 0);
+    mac_table_set_limits(&t, 100, 2);  // 2 macs per port
+
+    uint8_t a[MAC_LEN] = {2, 0, 0, 0, 2, 1};
+    uint8_t b[MAC_LEN] = {2, 0, 0, 0, 2, 2};
+    uint8_t c[MAC_LEN] = {2, 0, 0, 0, 2, 3};
+
+    CHECK(mac_table_insert(&t, a, 0) == MAC_NEW);
+    CHECK(mac_table_insert(&t, b, 0) == MAC_NEW);
+    CHECK(mac_table_insert(&t, c, 0) == MAC_PORT_FULL);  // third one on port 0
+    CHECK(mac_table_lookup(&t, c) == -1);
+    CHECK(mac_table_insert(&t, a, 0) == MAC_SAME);       // old ones still fine
+    CHECK(mac_table_port_count(&t, 0) == 2);
+
+    // c on port 1 is fine, then a moving to port 1 fills it
+    CHECK(mac_table_insert(&t, c, 1) == MAC_NEW);
+    CHECK(mac_table_insert(&t, a, 1) == MAC_MOVED);
+    CHECK(mac_table_port_count(&t, 0) == 1);
+    CHECK(mac_table_port_count(&t, 1) == 2);
+    CHECK(mac_table_insert(&t, b, 1) == MAC_PORT_FULL);  // cant move, port 1 full
+    CHECK(mac_table_lookup(&t, b) == 0);                 // b stays where it was
+
+    // flushing a port frees its slots
+    CHECK(mac_table_remove_port(&t, 1) == 2);
+    CHECK(mac_table_port_count(&t, 1) == 0);
+    CHECK(mac_table_count(&t) == 1);
+    CHECK(mac_table_lookup(&t, a) == -1);
+    CHECK(mac_table_lookup(&t, b) == 0);
 
     mac_table_destroy(&t);
 }
@@ -186,7 +221,7 @@ static void test_mac_threads(void)
     int ports[NTHREADS];
 
     CHECK(mac_table_init(&shared) == 0);
-    mac_table_set_max(&shared, 50);  // forces lots of evictions while threads run
+    mac_table_set_limits(&shared, 50, 1000);  // forces lots of evictions while threads run
     for (int i = 0; i < NTHREADS; i++) {
         ports[i] = i;
         CHECK(pthread_create(&th[i], NULL, worker, &ports[i]) == 0);
@@ -207,6 +242,7 @@ int main(void)
     test_mac_basic();
     test_mac_aging();
     test_mac_lru();
+    test_mac_port_security();
 
     // the thread test prints a lot of mac moved lines, hide them
     if (freopen("/dev/null", "w", stderr) == NULL)
