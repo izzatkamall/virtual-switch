@@ -1,0 +1,18 @@
+# build output
+*.o
+test_frame_mac
+test_frame_mac_tsan
+test_frame_mac_asan
+switch
+host
+swctl
+
+# not part of this project
+BSAI24078_Lab9/
+BSAI24078_Lab9.zip
+BSAI24078_Lab10.zip
+*.pdf
+Virtual Switch Briefing.html
+
+# lab 10 is submitted on its own
+lab10/
