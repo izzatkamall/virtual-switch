@@ -14,6 +14,7 @@
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,11 +28,36 @@
 #define MAX_PORTS 64
 #define QUEUE_LEN 64  // frames waiting per port
 
-// a frame waiting in a port queue
+// one received frame, shared by every queue it goes into
+// refs counts how many queues still hold it, the last one frees it
 struct pkt {
+    atomic_int refs;
     struct frame_header h;
     uint8_t payload[FRAME_MAX_PAYLOAD];
 };
+
+static struct pkt *pkt_new(const struct frame_header *h, const uint8_t *payload)
+{
+    struct pkt *k = malloc(sizeof(*k));
+    if (k == NULL)
+        return NULL;
+    atomic_init(&k->refs, 1);
+    k->h = *h;
+    memcpy(k->payload, payload, h->length);
+    return k;
+}
+
+static void pkt_get(struct pkt *k)
+{
+    atomic_fetch_add(&k->refs, 1);
+}
+
+// drops one reference, frees it if that was the last one
+static void pkt_put(struct pkt *k)
+{
+    if (atomic_fetch_sub(&k->refs, 1) == 1)
+        free(k);
+}
 
 // FREE: nobody here, UP: host connected, CLOSING: host left and
 // threads are stopping, DONE: threads stopped, rx needs a join
@@ -59,29 +85,21 @@ static struct mac_table table;
 
 // puts a frame on a port queue, never blocks
 // if the queue is full the frame is dropped and counted
-static void port_enqueue(int p, const struct frame_header *h, const uint8_t *payload)
+static void port_enqueue(int p, struct pkt *k)
 {
     struct port *pt = &ports[p];
-
-    // copy made outside the lock
-    struct pkt *k = malloc(sizeof(*k));
-    if (k == NULL)
-        return;
-    k->h = *h;
-    memcpy(k->payload, payload, h->length);
 
     pthread_mutex_lock(&pt->lock);
     if (pt->state != PORT_UP) {
         pthread_mutex_unlock(&pt->lock);
-        free(k);
         return;
     }
     if (pt->count == QUEUE_LEN) {
         pt->dropped++;
         pthread_mutex_unlock(&pt->lock);
-        free(k);
         return;
     }
+    pkt_get(k);  // the queue holds a reference now
     pt->queue[(pt->head + pt->count) % QUEUE_LEN] = k;
     pt->count++;
     pthread_cond_signal(&pt->not_empty);
@@ -99,16 +117,23 @@ static void forward(int in_port, const struct frame_header *h, const uint8_t *pa
     if (out == in_port)
         return;  // dest is on the same port, nothing to do
 
-    if (out >= 0) {
-        port_enqueue(out, h, payload);
+    // one copy no matter how many ports it goes to
+    struct pkt *k = pkt_new(h, payload);
+    if (k == NULL)
         return;
+
+    if (out >= 0) {
+        port_enqueue(out, k);
+    } else {
+        // broadcast or unknown dest, send to everyone else
+        for (int p = 0; p < num_ports; p++) {
+            if (p != in_port)
+                port_enqueue(p, k);
+        }
     }
 
-    // broadcast or unknown dest, send to everyone else
-    for (int p = 0; p < num_ports; p++) {
-        if (p != in_port)
-            port_enqueue(p, h, payload);
-    }
+    // let go of our own reference, frees it if no queue took it
+    pkt_put(k);
 }
 
 // takes frames off the queue and writes them to the host
@@ -132,7 +157,7 @@ static void *tx_thread(void *arg)
         pthread_mutex_unlock(&pt->lock);
 
         int rc = frame_write(fd, &k->h, k->payload);
-        free(k);
+        pkt_put(k);
         if (rc < 0) {
             // host is gone, wake up the rx thread so it cleans up
             shutdown(fd, SHUT_RDWR);
@@ -163,7 +188,7 @@ static void *rx_thread(void *arg)
     // both threads are done with the fd now
     pthread_mutex_lock(&pt->lock);
     while (pt->count > 0) {
-        free(pt->queue[pt->head]);
+        pkt_put(pt->queue[pt->head]);
         pt->head = (pt->head + 1) % QUEUE_LEN;
         pt->count--;
     }
