@@ -13,6 +13,7 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <semaphore.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -30,6 +31,7 @@
 #define MAC_AGE_SECS 30  // forget a mac not seen for this long
 #define MAC_MAX_ENTRIES 1024  // biggest the mac table can get
 #define MAC_PER_PORT 16  // port security, more than this and the port is shut
+#define PORT_WAIT_SECS 5  // how long a new host waits for a free port
 
 // one received frame, shared by every queue it goes into
 // refs counts how many queues still hold it, the last one frees it
@@ -85,6 +87,7 @@ struct port {
 static struct port ports[MAX_PORTS];
 static int num_ports;
 static struct mac_table table;
+static sem_t free_ports;  // counts ports nobody is using
 
 // set when the switch is shutting down, the cond wakes sleeping threads
 static pthread_mutex_t stop_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -217,6 +220,9 @@ static void *rx_thread(void *arg)
     pt->state = PORT_DONE;
     pthread_mutex_unlock(&pt->lock);
 
+    // one more port free, wakes up a host waiting in main
+    sem_post(&free_ports);
+
     printf("port %d disconnected (%lu frames dropped)\n", pt->id, dropped);
     fflush(stdout);
     return NULL;
@@ -301,6 +307,32 @@ static void *aging_thread(void *arg)
     return NULL;
 }
 
+// waits for a free port, returns 0 if we got one, -1 on timeout
+static int wait_for_port(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += PORT_WAIT_SECS;
+
+    while (sem_timedwait(&free_ports, &ts) < 0) {
+        if (errno != EINTR)
+            return -1;
+    }
+    return 0;
+}
+
+// tells a host there is no room, as a normal frame so test hosts can read it
+static void send_switch_full(int fd)
+{
+    struct frame_header h;
+    memset(&h, 0, sizeof(h));
+    memcpy(h.dst, MAC_BROADCAST, MAC_LEN);
+    h.vlan = 1;
+    h.priority = PRIO_HIGH;
+    h.length = 11;
+    frame_write(fd, &h, (const uint8_t *)"switch full");
+}
+
 static int make_listen_socket(int tcp_port)
 {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -371,6 +403,11 @@ int main(int argc, char *argv[])
         }
     }
 
+    if (sem_init(&free_ports, 0, (unsigned int)num_ports) != 0) {
+        perror("sem_init");
+        return 1;
+    }
+
     int listen_fd = make_listen_socket(tcp_port);
     if (listen_fd < 0)
         return 1;
@@ -393,10 +430,19 @@ int main(int argc, char *argv[])
             break;
         }
 
+        // all ports busy, wait a bit for one to free up
+        if (wait_for_port() < 0) {
+            printf("switch full, sending a new host away\n");
+            fflush(stdout);
+            send_switch_full(fd);
+            close(fd);
+            continue;
+        }
+
         int p = attach_host(fd);
         if (p < 0) {
-            // no free port, the semaphore version comes later
-            printf("no free port, dropping new host\n");
+            printf("could not attach host\n");
+            sem_post(&free_ports);  // give the slot back
             close(fd);
         } else {
             printf("host connected on port %d\n", p);
@@ -405,6 +451,7 @@ int main(int argc, char *argv[])
     }
 
     close(listen_fd);
+    sem_destroy(&free_ports);
     mac_table_destroy(&table);
     return 0;
 }
