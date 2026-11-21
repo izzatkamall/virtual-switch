@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "../src/frame.h"
 #include "../src/mac_table.h"
@@ -83,6 +84,33 @@ static void test_mac_basic(void)
     mac_table_destroy(&t);
 }
 
+static void test_mac_aging(void)
+{
+    struct mac_table t;
+    CHECK(mac_table_init(&t) == 0);
+
+    uint8_t a[MAC_LEN] = {0, 0, 0, 0, 0, 1};
+    uint8_t b[MAC_LEN] = {0, 0, 0, 0, 0, 2};
+    struct timespec wait = {0, 50 * 1000000};  // 50ms
+
+    mac_table_insert(&t, a, 1);
+    nanosleep(&wait, NULL);
+    mac_table_insert(&t, b, 2);
+
+    CHECK(mac_table_age(&t, 1000) == 0);  // nothing is a second old
+    CHECK(mac_table_age(&t, 30) == 1);    // only a is older than 30ms
+    CHECK(mac_table_lookup(&t, a) == -1);
+    CHECK(mac_table_lookup(&t, b) == 2);
+
+    // seeing a mac again resets its age
+    nanosleep(&wait, NULL);
+    mac_table_insert(&t, b, 2);
+    CHECK(mac_table_age(&t, 30) == 0);
+    CHECK(mac_table_lookup(&t, b) == 2);
+
+    mac_table_destroy(&t);
+}
+
 // lots of threads hitting the same macs, run this with tsan
 #define NTHREADS 8
 #define ITERS 2000
@@ -125,6 +153,7 @@ int main(void)
 {
     test_frame();
     test_mac_basic();
+    test_mac_aging();
 
     // the thread test prints a lot of mac moved lines, hide them
     if (freopen("/dev/null", "w", stderr) == NULL)

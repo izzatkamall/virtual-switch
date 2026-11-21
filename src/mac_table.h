@@ -8,7 +8,7 @@
 
 #include <pthread.h>
 #include <stddef.h>
-#include <time.h>
+#include <stdint.h>
 
 #include "frame.h"
 
@@ -17,7 +17,7 @@
 struct mac_entry {
     uint8_t mac[MAC_LEN];
     int port;
-    time_t last_seen;  // for aging later
+    uint64_t last_seen;  // ms on the monotonic clock
     struct mac_entry *next;
 };
 
@@ -45,5 +45,11 @@ int mac_table_insert(struct mac_table *t, const uint8_t mac[MAC_LEN], int port);
 
 // returns the port or -1 if we dont know the mac
 int mac_table_lookup(struct mac_table *t, const uint8_t mac[MAC_LEN]);
+
+// removes entries not seen for more than max_age_ms, returns how many
+int mac_table_age(struct mac_table *t, uint64_t max_age_ms);
+
+// ms since some fixed point, only good for measuring gaps
+uint64_t now_ms(void);
 
 #endif

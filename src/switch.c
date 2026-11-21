@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "frame.h"
@@ -27,6 +28,7 @@
 
 #define MAX_PORTS 64
 #define QUEUE_LEN 64  // frames waiting per port
+#define MAC_AGE_SECS 30  // forget a mac not seen for this long
 
 // one received frame, shared by every queue it goes into
 // refs counts how many queues still hold it, the last one frees it
@@ -82,6 +84,11 @@ struct port {
 static struct port ports[MAX_PORTS];
 static int num_ports;
 static struct mac_table table;
+
+// set when the switch is shutting down, the cond wakes sleeping threads
+static pthread_mutex_t stop_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t stop_cond = PTHREAD_COND_INITIALIZER;
+static int stopping = 0;
 
 // puts a frame on a port queue, never blocks
 // if the queue is full the frame is dropped and counted
@@ -251,6 +258,37 @@ static int attach_host(int fd)
     return -1;
 }
 
+// waits about one second, returns 1 if we should stop
+static int wait_one_second(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += 1;
+
+    pthread_mutex_lock(&stop_lock);
+    while (!stopping) {
+        if (pthread_cond_timedwait(&stop_cond, &stop_lock, &ts) == ETIMEDOUT)
+            break;
+    }
+    int s = stopping;
+    pthread_mutex_unlock(&stop_lock);
+    return s;
+}
+
+// removes old mac entries once a second
+static void *aging_thread(void *arg)
+{
+    (void)arg;
+    while (!wait_one_second()) {
+        int n = mac_table_age(&table, MAC_AGE_SECS * 1000);
+        if (n > 0) {
+            printf("aged out %d mac entries\n", n);
+            fflush(stdout);
+        }
+    }
+    return NULL;
+}
+
 static int make_listen_socket(int tcp_port)
 {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -323,6 +361,12 @@ int main(int argc, char *argv[])
     int listen_fd = make_listen_socket(tcp_port);
     if (listen_fd < 0)
         return 1;
+
+    pthread_t aging_tid;
+    if (pthread_create(&aging_tid, NULL, aging_thread, NULL) != 0) {
+        fprintf(stderr, "could not start aging thread\n");
+        return 1;
+    }
 
     printf("switch listening on port %d with %d ports\n", tcp_port, num_ports);
     fflush(stdout);

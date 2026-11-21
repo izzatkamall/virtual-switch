@@ -5,6 +5,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+uint64_t now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
 
 // simple hash, just mix the mac bytes together
 static int hash_mac(const uint8_t mac[MAC_LEN])
@@ -75,7 +83,7 @@ int mac_table_insert(struct mac_table *t, const uint8_t mac[MAC_LEN], int port)
         } else {
             result = MAC_SAME;
         }
-        e->last_seen = time(NULL);
+        e->last_seen = now_ms();
     } else {
         e = malloc(sizeof(*e));
         if (e == NULL) {
@@ -83,7 +91,7 @@ int mac_table_insert(struct mac_table *t, const uint8_t mac[MAC_LEN], int port)
         } else {
             memcpy(e->mac, mac, MAC_LEN);
             e->port = port;
-            e->last_seen = time(NULL);
+            e->last_seen = now_ms();
             e->next = b->head;
             b->head = e;
             result = MAC_NEW;
@@ -113,4 +121,31 @@ int mac_table_lookup(struct mac_table *t, const uint8_t mac[MAC_LEN])
     pthread_mutex_unlock(&b->lock);
 
     return port;
+}
+
+int mac_table_age(struct mac_table *t, uint64_t max_age_ms)
+{
+    int removed = 0;
+    uint64_t now = now_ms();
+
+    // one bucket at a time so forwarding keeps going in the others
+    for (int i = 0; i < MAC_TABLE_BUCKETS; i++) {
+        struct mac_bucket *b = &t->buckets[i];
+        pthread_mutex_lock(&b->lock);
+
+        // pointer to the link so we can unlink without a prev pointer
+        struct mac_entry **link = &b->head;
+        while (*link != NULL) {
+            struct mac_entry *e = *link;
+            if (now - e->last_seen > max_age_ms) {
+                *link = e->next;
+                free(e);
+                removed++;
+            } else {
+                link = &e->next;
+            }
+        }
+        pthread_mutex_unlock(&b->lock);
+    }
+    return removed;
 }
