@@ -32,6 +32,7 @@
 
 #define DUMP_FILE "mac_dump.txt"  // SIGUSR1 writes the mac table here
 #define LOG_FILE "switch.log"
+#define RATE_TICK_MS 100  // how often the rate thread refills tokens
 #define SEND_BUF_SIZE 8192  // kernel send buffer per host, linux doubles it
 
 // one received frame, shared by every queue it goes into
@@ -81,6 +82,11 @@ struct port {
     // frames waiting to go out, one queue per priority
     struct qos out;
     unsigned long dropped;
+
+    // token bucket, in tenths of a frame so slow rates still work
+    // with 100ms ticks. rate 0 means no limit
+    int rate;
+    int tokens;
 };
 
 static struct port ports[MAX_PORTS];
@@ -122,6 +128,20 @@ static int apply_config(void)
 static pthread_mutex_t stop_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t stop_cond = PTHREAD_COND_INITIALIZER;
 static int stopping = 0;
+
+// absolute time ms from now, for the timedwait calls
+static struct timespec deadline_in(int ms)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += ms / 1000;
+    ts.tv_nsec += (long)(ms % 1000) * 1000000;
+    if (ts.tv_nsec >= 1000000000) {
+        ts.tv_sec++;
+        ts.tv_nsec -= 1000000000;
+    }
+    return ts;
+}
 
 // puts a frame on a port queue, never blocks
 // if the queue is full the frame is dropped and counted
@@ -188,12 +208,23 @@ static void *tx_thread(void *arg)
 
     while (1) {
         pthread_mutex_lock(&pt->lock);
-        while (qos_count(&pt->out) == 0 && pt->state == PORT_UP)
-            pthread_cond_wait(&pt->not_empty, &pt->lock);
+        while (pt->state == PORT_UP) {
+            if (qos_count(&pt->out) == 0) {
+                pthread_cond_wait(&pt->not_empty, &pt->lock);
+            } else if (pt->rate > 0 && pt->tokens < 10) {
+                // out of tokens, the rate thread wakes us when it refills
+                struct timespec ts = deadline_in(RATE_TICK_MS);
+                pthread_cond_timedwait(&pt->not_empty, &pt->lock, &ts);
+            } else {
+                break;
+            }
+        }
         if (pt->state != PORT_UP) {
             pthread_mutex_unlock(&pt->lock);
             break;
         }
+        if (pt->rate > 0)
+            pt->tokens -= 10;  // one frame costs ten tenths
         // weighted round robin picks which priority goes next
         struct pkt *k = qos_pop(&pt->out, now_ms());
         pthread_mutex_unlock(&pt->lock);
@@ -271,6 +302,8 @@ static int attach_host(int fd)
         pt->fd = fd;
         pt->state = PORT_UP;
         qos_init(&pt->out);
+        pt->rate = get_config().rate_limit;
+        pt->tokens = pt->rate * 10;  // start with a full bucket
         pt->dropped = 0;
         pthread_mutex_unlock(&pt->lock);
 
@@ -345,8 +378,8 @@ static void *signal_thread(void *arg)
                 log_msg("got SIGHUP but there is no config file");
             } else if (apply_config() == 0) {
                 struct config c = get_config();
-                log_msg("reloaded %s: mac_age %d mac_max %d mac_per_port %d port_wait %d",
-                       cfg_path, c.mac_age, c.mac_max, c.mac_per_port, c.port_wait);
+                log_msg("reloaded %s: mac_age %d mac_max %d mac_per_port %d port_wait %d rate_limit %d",
+                       cfg_path, c.mac_age, c.mac_max, c.mac_per_port, c.port_wait, c.rate_limit);
             } else {
                 log_msg("config has errors, keeping the old settings");
             }
@@ -387,12 +420,10 @@ static void close_all_ports(void)
     }
 }
 
-// waits about one second, returns 1 if we should stop
-static int wait_one_second(void)
+// waits ms or until we start stopping, returns 1 if we should stop
+static int wait_or_stop(int ms)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec += 1;
+    struct timespec ts = deadline_in(ms);
 
     pthread_mutex_lock(&stop_lock);
     while (!stopping) {
@@ -405,10 +436,34 @@ static int wait_one_second(void)
 }
 
 // removes old mac entries once a second
+// refills every port's token bucket each tick
+static void *rate_thread(void *arg)
+{
+    (void)arg;
+    while (!wait_or_stop(RATE_TICK_MS)) {
+        // read the config once, not while holding a port lock
+        int rate = get_config().rate_limit;
+
+        for (int p = 0; p < num_ports; p++) {
+            struct port *pt = &ports[p];
+            pthread_mutex_lock(&pt->lock);
+            pt->rate = rate;
+            // rate frames per second is rate tenths per 100ms tick,
+            // bucket holds one second worth at most
+            pt->tokens += rate;
+            if (pt->tokens > rate * 10)
+                pt->tokens = rate * 10;
+            pthread_cond_broadcast(&pt->not_empty);
+            pthread_mutex_unlock(&pt->lock);
+        }
+    }
+    return NULL;
+}
+
 static void *aging_thread(void *arg)
 {
     (void)arg;
-    while (!wait_one_second()) {
+    while (!wait_or_stop(1000)) {
         int n = mac_table_age(&table, (uint64_t)get_config().mac_age * 1000);
         if (n > 0) {
             log_msg("aged out %d mac entries", n);
@@ -552,6 +607,12 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    pthread_t rate_tid;
+    if (pthread_create(&rate_tid, NULL, rate_thread, NULL) != 0) {
+        fprintf(stderr, "could not start rate thread\n");
+        return 1;
+    }
+
     pthread_t aging_tid;
     if (pthread_create(&aging_tid, NULL, aging_thread, NULL) != 0) {
         fprintf(stderr, "could not start aging thread\n");
@@ -608,6 +669,7 @@ int main(int argc, char *argv[])
 
     close_all_ports();
     pthread_join(aging_tid, NULL);
+    pthread_join(rate_tid, NULL);
 
     // signal thread might still be in sigwait if we got here without SIGINT
     pthread_kill(sig_tid, SIGINT);

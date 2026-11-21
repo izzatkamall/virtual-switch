@@ -6,6 +6,7 @@
 //   mac_max 1024      most entries in the mac table
 //   mac_per_port 16   port security limit
 //   port_wait 5       seconds a new host waits for a free port
+//   rate_limit 0      most frames per second out of each port, 0 is no limit
 
 #ifndef CONFIG_H
 #define CONFIG_H
@@ -15,6 +16,7 @@ struct config {
     int mac_max;
     int mac_per_port;
     int port_wait;
+    int rate_limit;
 };
 
 void config_defaults(struct config *c);

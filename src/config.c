@@ -14,6 +14,7 @@ void config_defaults(struct config *c)
     c->mac_max = 1024;
     c->mac_per_port = 16;
     c->port_wait = 5;
+    c->rate_limit = 0;
 }
 
 // reads a whole number, returns -1 if it isnt one or is out of range
@@ -64,6 +65,8 @@ int config_load(const char *path, struct config *c)
             rc = parse_int(val, 1, 1000000, &tmp.mac_per_port);
         else if (strcmp(key, "port_wait") == 0)
             rc = parse_int(val, 0, 3600, &tmp.port_wait);
+        else if (strcmp(key, "rate_limit") == 0)
+            rc = parse_int(val, 0, 100000, &tmp.rate_limit);
         else {
             log_msg("%s:%d: unknown key %s", path, lineno, key);
             bad = 1;
