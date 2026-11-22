@@ -6,6 +6,14 @@
 //   rx  reads frames, learns the source mac, puts the frame on the out queues
 //   tx  takes frames off its own queue and writes them to the host
 // a slow host only fills up its own queue, frames get dropped when its full
+//
+// lock order, always taken top to bottom, never two port locks at once:
+//   1. attach_lock          picking a port for a new host, swctl shutdown/up
+//   2. port lock            one port at a time
+//   3. mac bucket locks     ascending index if more than one
+//   4. mac count_lock
+//   5. leaf locks: stats shm mutex, cfg_lock, log lock, stop_lock
+//      nothing else is ever locked while holding one of these
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -36,6 +44,7 @@
 #define DUMP_FILE "mac_dump.txt"  // SIGUSR1 writes the mac table here
 #define LOG_FILE "switch.log"
 #define RATE_TICK_MS 100  // how often the rate thread refills tokens
+#define DRAIN_SECS 2  // swctl shutdown waits this long for a queue to drain
 #define SEND_BUF_SIZE 8192  // kernel send buffer per host, linux doubles it
 
 // one received frame, shared by every queue it goes into
@@ -77,8 +86,11 @@ struct port {
     int id;
     pthread_mutex_t lock;  // protects everything below
     pthread_cond_t not_empty;
+    pthread_cond_t done;  // broadcast when the port reaches DONE
     int fd;
     int state;
+    int enabled;   // 0 after swctl shutdown, no host can use it
+    int draining;  // send whats queued then hang up
     pthread_t rx_tid;
     pthread_t tx_tid;
 
@@ -95,6 +107,10 @@ struct port {
 };
 
 static struct port ports[MAX_PORTS];
+
+// held while picking a port for a new host and by swctl shutdown/up,
+// so the free_ports count and the enabled flags always agree
+static pthread_mutex_t attach_lock = PTHREAD_MUTEX_INITIALIZER;
 static int num_ports;
 static struct mac_table table;
 static struct shm_stats *stats;  // counters swctl can read
@@ -182,7 +198,7 @@ static int port_enqueue(int p, struct pkt *k)
     int rc;
 
     pthread_mutex_lock(&pt->lock);
-    if (pt->state != PORT_UP || (!pt->trunk && pt->vlan != k->h.vlan)) {
+    if (pt->state != PORT_UP || pt->draining || (!pt->trunk && pt->vlan != k->h.vlan)) {
         rc = -1;
     } else if (qos_push(&pt->out, k->h.priority, k, now_ms()) < 0) {
         shm_stats_add(stats, p, STAT_DROPPED, 1);  // that priority queue is full
@@ -205,7 +221,11 @@ static int forward(int in_port, struct frame_header *h, const uint8_t *payload)
     pthread_mutex_lock(&in->lock);
     if (!in->trunk)
         h->vlan = (uint16_t)in->vlan;
+    int draining = in->draining;
     pthread_mutex_unlock(&in->lock);
+
+    if (draining)
+        return 0;  // port is being shut down, ignore what it sends
 
     if (mac_table_insert(&table, h->src, in_port) == MAC_PORT_FULL) {
         log_msg("port %d has more than %d macs, shutting it down", in_port, get_config().mac_per_port);
@@ -249,7 +269,9 @@ static void *tx_thread(void *arg)
     while (1) {
         pthread_mutex_lock(&pt->lock);
         while (pt->state == PORT_UP) {
-            if (qos_count(&pt->out) == 0) {
+            if (qos_count(&pt->out) == 0 && pt->draining) {
+                break;  // everything queued has been sent
+            } else if (qos_count(&pt->out) == 0) {
                 pthread_cond_wait(&pt->not_empty, &pt->lock);
             } else if (pt->rate > 0 && pt->tokens < 10) {
                 // out of tokens, the rate thread wakes us when it refills
@@ -261,6 +283,12 @@ static void *tx_thread(void *arg)
         }
         if (pt->state != PORT_UP) {
             pthread_mutex_unlock(&pt->lock);
+            break;
+        }
+        if (qos_count(&pt->out) == 0) {
+            // drained, hang up so the rx thread cleans up
+            pthread_mutex_unlock(&pt->lock);
+            shutdown(fd, SHUT_RDWR);
             break;
         }
         if (pt->rate > 0)
@@ -314,16 +342,22 @@ static void *rx_thread(void *arg)
     close(pt->fd);
     pt->fd = -1;
     pt->state = PORT_DONE;
+    pt->draining = 0;
+    int give_back = pt->enabled;  // a shut down port doesnt count as free
+    pthread_cond_broadcast(&pt->done);
     pthread_mutex_unlock(&pt->lock);
 
     // one more port free, wakes up a host waiting in main
-    sem_post(&free_ports);
+    if (give_back)
+        sem_post(&free_ports);
 
     log_msg("port %d disconnected", pt->id);
     return NULL;
 }
 
-// finds a free port and starts its threads, returns the port or -1
+// finds a free port and starts its threads, returns the port,
+// -1 if no port is free, -2 if a thread couldnt be started
+// caller holds attach_lock
 static int attach_host(int fd)
 {
     for (int p = 0; p < num_ports; p++) {
@@ -331,9 +365,10 @@ static int attach_host(int fd)
 
         pthread_mutex_lock(&pt->lock);
         int state = pt->state;
+        int enabled = pt->enabled;
         pthread_mutex_unlock(&pt->lock);
 
-        if (state == PORT_UP || state == PORT_CLOSING)
+        if (!enabled || state == PORT_UP || state == PORT_CLOSING)
             continue;
 
         // old receiver already finished, join it before reusing the port
@@ -354,7 +389,7 @@ static int attach_host(int fd)
             pt->fd = -1;
             pt->state = PORT_FREE;
             pthread_mutex_unlock(&pt->lock);
-            return -1;
+            return -2;
         }
         if (pthread_create(&pt->rx_tid, NULL, rx_thread, pt) != 0) {
             // stop the sender we just made
@@ -364,7 +399,7 @@ static int attach_host(int fd)
             pthread_cond_broadcast(&pt->not_empty);
             pthread_mutex_unlock(&pt->lock);
             pthread_join(pt->tx_tid, NULL);
-            return -1;
+            return -2;
         }
         return p;
     }
@@ -548,6 +583,7 @@ static const char *state_name(int state)
     switch (state) {
     case PORT_UP: return "up";
     case PORT_CLOSING: return "closing";
+    case -1: return "down";
     default: return "free";
     }
 }
@@ -562,7 +598,7 @@ static void cmd_show_ports(FILE *out)
     for (int p = 0; p < num_ports; p++) {
         struct port *pt = &ports[p];
         pthread_mutex_lock(&pt->lock);
-        int state = pt->state;
+        int state = pt->enabled ? pt->state : -1;
         int vlan = pt->vlan;
         int trunk = pt->trunk;
         pthread_mutex_unlock(&pt->lock);
@@ -578,6 +614,96 @@ static void cmd_show_ports(FILE *out)
                 ps[p].count[STAT_IN], ps[p].count[STAT_OUT],
                 ps[p].count[STAT_DROPPED], ps[p].count[STAT_MIRRORED]);
     }
+}
+
+// swctl shutdown: drain the queue, kick the host, join its threads
+static void cmd_shutdown(int p, FILE *out)
+{
+    struct port *pt = &ports[p];
+    pthread_mutex_lock(&attach_lock);
+    pthread_mutex_lock(&pt->lock);
+
+    if (!pt->enabled) {
+        pthread_mutex_unlock(&pt->lock);
+        pthread_mutex_unlock(&attach_lock);
+        fprintf(out, "port %d is already down\n", p);
+        return;
+    }
+    pt->enabled = 0;
+
+    if (pt->state == PORT_UP) {
+        // tx sends whats left and hangs up, give it DRAIN_SECS
+        pt->draining = 1;
+        pthread_cond_broadcast(&pt->not_empty);
+        struct timespec ts = deadline_in(DRAIN_SECS * 1000);
+        while (pt->state != PORT_DONE) {
+            if (pthread_cond_timedwait(&pt->done, &pt->lock, &ts) == ETIMEDOUT)
+                break;
+        }
+        if (pt->state != PORT_DONE) {
+            // host isnt reading, stop waiting and cut it off
+            fprintf(out, "port %d did not drain in %ds, dropping the rest\n", p, DRAIN_SECS);
+            if (pt->state == PORT_UP)
+                shutdown(pt->fd, SHUT_RDWR);
+            while (pt->state != PORT_DONE)
+                pthread_cond_wait(&pt->done, &pt->lock);
+        }
+    } else if (pt->state == PORT_CLOSING) {
+        // host is leaving on its own, just wait for it
+        while (pt->state != PORT_DONE)
+            pthread_cond_wait(&pt->done, &pt->lock);
+    } else {
+        // nobody here, this port no longer counts as free
+        // if trywait fails main already took its slot, and attach_host
+        // will see the port is disabled and keep that slot
+        if (sem_trywait(&free_ports) != 0 && errno != EAGAIN)
+            log_msg("sem_trywait: %s", strerror(errno));
+    }
+
+    int must_join = pt->state == PORT_DONE;
+    pt->state = PORT_FREE;
+    pthread_mutex_unlock(&pt->lock);
+
+    // rx thread has finished, nobody else joins it since the port is
+    // disabled and we hold attach_lock
+    if (must_join)
+        pthread_join(pt->rx_tid, NULL);
+    pthread_mutex_unlock(&attach_lock);
+
+    log_msg("port %d shut down by swctl", p);
+    fprintf(out, "port %d is down\n", p);
+}
+
+static void cmd_up(int p, FILE *out)
+{
+    struct port *pt = &ports[p];
+    pthread_mutex_lock(&attach_lock);
+    pthread_mutex_lock(&pt->lock);
+    int was = pt->enabled;
+    pt->enabled = 1;
+    pthread_mutex_unlock(&pt->lock);
+
+    // shutdown always leaves the port FREE, so its free again now
+    if (!was)
+        sem_post(&free_ports);
+    pthread_mutex_unlock(&attach_lock);
+
+    if (was) {
+        fprintf(out, "port %d is already up\n", p);
+    } else {
+        log_msg("port %d brought up by swctl", p);
+        fprintf(out, "port %d is up\n", p);
+    }
+}
+
+// reads a port number, returns -1 if its not a valid port
+static int parse_port(const char *s)
+{
+    char *end;
+    long p = strtol(s, &end, 10);
+    if (end == s || *end != '\0' || p < 0 || p >= num_ports)
+        return -1;
+    return (int)p;
 }
 
 // runs one command and writes the reply into out
@@ -599,6 +725,28 @@ static void run_command(char *cmd, FILE *out)
         mac_table_clear(&table);
         log_msg("mac table cleared by swctl");
         fprintf(out, "mac table cleared\n");
+    } else if (strncmp(cmd, "shutdown ", 9) == 0 || strncmp(cmd, "up ", 3) == 0) {
+        char *arg = strchr(cmd, ' ') + 1;
+        int p = parse_port(arg);
+        if (p < 0)
+            fprintf(out, "bad port %s, use 0 to %d\n", arg, num_ports - 1);
+        else if (cmd[0] == 's')
+            cmd_shutdown(p, out);
+        else
+            cmd_up(p, out);
+    } else if (strncmp(cmd, "vlan ", 5) == 0) {
+        char ps[16], vs[16], extra[4];
+        int vlan;
+        int p = -1;
+        if (sscanf(cmd + 5, "%15s %15s %3s", ps, vs, extra) == 2)
+            p = parse_port(ps);
+        vlan = atoi(vs);
+        if (p < 0 || vlan < VLAN_MIN || vlan > VLAN_MAX) {
+            fprintf(out, "usage: vlan <port 0-%d> <vlan %d-%d>\n", num_ports - 1, VLAN_MIN, VLAN_MAX);
+        } else {
+            set_port_vlan(p, vlan, 0);  // makes it an access port in that vlan
+            fprintf(out, "port %d is in vlan %d\n", p, vlan);
+        }
     } else {
         fprintf(out, "unknown command: %s\n", cmd);
     }
@@ -768,8 +916,11 @@ int main(int argc, char *argv[])
         ports[p].state = PORT_FREE;
         ports[p].vlan = 1;
         ports[p].trunk = 0;
+        ports[p].enabled = 1;
+        ports[p].draining = 0;
         if (pthread_mutex_init(&ports[p].lock, NULL) != 0 ||
-            pthread_cond_init(&ports[p].not_empty, NULL) != 0) {
+            pthread_cond_init(&ports[p].not_empty, NULL) != 0 ||
+            pthread_cond_init(&ports[p].done, NULL) != 0) {
             fprintf(stderr, "port init failed\n");
             return 1;
         }
@@ -860,8 +1011,16 @@ int main(int argc, char *argv[])
         if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) < 0)
             log_msg("setsockopt SO_SNDBUF: %s", strerror(errno));
 
+        pthread_mutex_lock(&attach_lock);
         int p = attach_host(fd);
-        if (p < 0) {
+        pthread_mutex_unlock(&attach_lock);
+        if (p == -1) {
+            // swctl shut the last free port while we waited, its slot
+            // went with it so dont give it back
+            log_msg("switch full, sending a new host away");
+            send_switch_full(fd);
+            close(fd);
+        } else if (p < 0) {
             log_msg("could not attach host");
             sem_post(&free_ports);  // give the slot back
             close(fd);
@@ -895,6 +1054,7 @@ int main(int argc, char *argv[])
     for (int p = 0; p < num_ports; p++) {
         pthread_mutex_destroy(&ports[p].lock);
         pthread_cond_destroy(&ports[p].not_empty);
+        pthread_cond_destroy(&ports[p].done);
     }
     sem_destroy(&free_ports);
     shm_stats_destroy(stats);  // also removes it from /dev/shm
