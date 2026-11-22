@@ -3,6 +3,18 @@
 # usage: tests/run_all.sh        (from the project folder, after make)
 cd "$(dirname "$0")/.."
 PORT=9500
+# RUN puts a tool in front of the switch, eg RUN="valgrind -q" tests/run_all.sh
+RUN=${RUN:-}
+OUT=/tmp/vswitch_switch.out
+
+# waits until the switch says its listening (slow under valgrind)
+wait_ready() {
+    for i in $(seq 300); do
+        grep -q "switch listening" $OUT 2>/dev/null && return 0
+        sleep 0.1
+    done
+    return 1
+}
 fails=0
 
 pass() { echo "ok   $1"; }
@@ -15,9 +27,10 @@ unit() {
 
 # $1 test file, $2 num ports, $3 config file (optional), $4 extra args
 live() {
-    ./switch $PORT $2 $3 > /dev/null 2>&1 &
+    rm -f $OUT
+    $RUN ./switch $PORT $2 $3 > $OUT 2>&1 &
     local sw=$!
-    sleep 0.3
+    wait_ready
     if timeout 120 python3 -I tests/$1 $PORT $4 > /tmp/vswitch_test.out 2>&1; then
         pass "$1"
     else

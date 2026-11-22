@@ -4,19 +4,31 @@
 cd "$(dirname "$0")/.."
 PORT=${1:-9900}
 fails=0
+RUN=${RUN:-}  # eg RUN="valgrind -q" to run the switch under a tool
+STOP_SECS=${STOP_SECS:-3}
+
+# waits until the switch says its listening (slow under valgrind)
+wait_ready() {
+    for i in $(seq 300); do
+        grep -q "switch listening" sw.log 2>/dev/null && return 0
+        sleep 0.1
+    done
+    return 1
+}
 
 # $1 name, $2 num ports, $3 python code to run against the switch (backgrounded)
 try() {
-    ./switch $PORT $2 > sw.log 2>&1 &
+    rm -f sw.log
+    $RUN ./switch $PORT $2 > sw.log 2>&1 &
     local sw=$!
-    sleep 0.3
+    wait_ready
     python3 -I -c "$3" $PORT > /dev/null 2>&1 &
     local py=$!
     sleep 1
     local start=$(date +%s.%N)
     kill -INT $sw
-    # give it 3 seconds to stop
-    for i in $(seq 30); do
+    # give it STOP_SECS to stop
+    for i in $(seq $((STOP_SECS * 10))); do
         kill -0 $sw 2>/dev/null || break
         sleep 0.1
     done

@@ -119,8 +119,12 @@ got, took = blast()
 got_in = port_count(0, 4) - in0
 print("     a sent 2000 in %.2fs without mirror, %.2fs with a frozen sniffer" % (base_t, took))
 check("switch read all 2000 from port 0 both times", base_in == 2000 and got_in == 2000)
-check("not slower with a frozen sniffer", took < base_t * 1.5 + 0.3)
-check("b got most of them both times (%d and %d)" % (base, got), got >= 1800 and base >= 1600)
+# under valgrind the switch is many times slower so speed means nothing
+if os.environ.get("RUN"):
+    print("     speed checks skipped, switch runs under %s" % os.environ["RUN"].split()[0])
+else:
+    check("not slower with a frozen sniffer", took < base_t * 1.5 + 0.3)
+    check("b got most of them both times (%d and %d)" % (base, got), got >= 1800 and base >= 1600)
 check("frozen sniffer dropped its copies instead (%d)" % port_count(2, 6), port_count(2, 6) > 0)
 dropped1 = port_count(1, 6)
 out1 = port_count(1, 5)

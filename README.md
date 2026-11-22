@@ -11,6 +11,8 @@ port, and the switch learns MAC addresses and forwards frames between them.
 make            # builds switch, host, swctl and the unit tests
 make test       # runs the 3 C unit tests
 make check      # runs every test (unit + live), takes about a minute
+make tsan       # every test with everything built with -fsanitize=thread
+make valgrind   # every live test with the switch running under valgrind
 make clean
 ```
 

@@ -37,12 +37,22 @@ test: $(TESTS)
 check: all
 	tests/run_all.sh
 
-# needs libtsan installed
+# every test with everything built with thread sanitizer, a race makes
+# the switch exit with 66 so the test fails. rebuild normally afterwards
 tsan:
 	$(MAKE) clean
-	$(MAKE) CFLAGS="$(CFLAGS) -fsanitize=thread" test
+	$(MAKE) CFLAGS="$(CFLAGS) -fsanitize=thread" all
+	TSAN_OPTIONS="exitcode=66" tests/run_all.sh
+	$(MAKE) clean
+	$(MAKE) all
+
+# every live test with the switch under valgrind, any error or leak
+# makes it exit with 99 so the test fails
+VALGRIND = valgrind -q --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=all --error-exitcode=99
+valgrind: all
+	RUN="$(VALGRIND)" STOP_SECS=10 tests/run_all.sh
 
 clean:
 	rm -f $(PROGS) $(TESTS)
 
-.PHONY: all test check tsan clean
+.PHONY: all test check tsan valgrind clean

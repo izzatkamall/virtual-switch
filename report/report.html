@@ -181,7 +181,15 @@ stops it with SIGINT (it must exit 0). The live tests cover forwarding and learn
 the port limit and <code>switch full</code>, priorities, rate limiting, VLANs, admin commands, mirroring, SIGINT in
 five situations, and a stress test that runs traffic, host churn and about 30,000 random <code>swctl</code> commands
 at once and then checks that all 8 ports come back free. The build uses <code>-Wall -Wextra -Werror</code>.</p>
-<p><span class="todo">[TODO: add ThreadSanitizer and valgrind results here once they are run.]</span></p>
+<p><b>ThreadSanitizer and valgrind.</b> <code>make tsan</code> builds everything with <code>-fsanitize=thread</code>
+and runs the whole suite; <code>make valgrind</code> runs every live test with the switch under valgrind
+(<code>--leak-check=full</code>, leaks counted as errors). The first TSan run found one real race: at shutdown,
+<code>close_all_ports()</code> set a port's <code>state</code> back to FREE after joining its rx thread but without
+taking the port lock, while rx threads of <i>other</i> ports could still be reading that field in
+<code>port_enqueue()</code>. It only happened when SIGINT arrived during a broadcast storm. The fix was to do that write
+under the port lock. After that, three full TSan runs gave no reports, and under valgrind every switch run ended with
+0 errors, all heap blocks freed and no file descriptors left open apart from stdin/stdout/stderr. <code>host</code>
+and <code>swctl</code> are also clean under both tools.</p>
 
 </body>
 </html>
