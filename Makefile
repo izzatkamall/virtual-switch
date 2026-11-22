@@ -10,8 +10,8 @@ TESTS = test_frame_mac test_net_io test_qos
 
 all: $(PROGS) $(TESTS)
 
-switch: src/switch.c src/mac_table.c src/config.c src/qos.c $(COMMON) $(HDRS)
-	$(CC) $(CFLAGS) -o $@ src/switch.c src/mac_table.c src/config.c src/qos.c $(COMMON) $(LIBS)
+switch: src/switch.c src/mac_table.c src/config.c src/qos.c src/shm_stats.c $(COMMON) $(HDRS)
+	$(CC) $(CFLAGS) -o $@ src/switch.c src/mac_table.c src/config.c src/qos.c src/shm_stats.c $(COMMON) $(LIBS)
 
 host: src/host.c $(COMMON) $(HDRS)
 	$(CC) $(CFLAGS) -o $@ src/host.c $(COMMON) $(LIBS)

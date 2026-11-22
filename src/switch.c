@@ -29,6 +29,7 @@
 #include "mac_table.h"
 #include "net_io.h"
 #include "qos.h"
+#include "shm_stats.h"
 
 #define DUMP_FILE "mac_dump.txt"  // SIGUSR1 writes the mac table here
 #define LOG_FILE "switch.log"
@@ -81,7 +82,6 @@ struct port {
 
     // frames waiting to go out, one queue per priority
     struct qos out;
-    unsigned long dropped;
 
     int vlan;   // vlan of an access port
     int trunk;  // 1 if this port carries every vlan
@@ -95,6 +95,7 @@ struct port {
 static struct port ports[MAX_PORTS];
 static int num_ports;
 static struct mac_table table;
+static struct shm_stats *stats;  // counters swctl can read
 static sem_t free_ports;  // counts ports nobody is using
 static int listen_fd = -1;
 
@@ -181,7 +182,7 @@ static int port_enqueue(int p, struct pkt *k)
     if (pt->state != PORT_UP || (!pt->trunk && pt->vlan != k->h.vlan)) {
         rc = -1;
     } else if (qos_push(&pt->out, k->h.priority, k, now_ms()) < 0) {
-        pt->dropped++;  // that priority queue is full
+        shm_stats_add(stats, p, STAT_DROPPED, 1);  // that priority queue is full
         rc = 0;
     } else {
         pkt_get(k);  // the queue holds a reference now
@@ -267,6 +268,8 @@ static void *tx_thread(void *arg)
 
         int rc = frame_write(fd, &k->h, k->payload);
         pkt_put(k);
+        if (rc == 0)
+            shm_stats_add(stats, pt->id, STAT_OUT, 1);
         if (rc < 0) {
             // host is gone, wake up the rx thread so it cleans up
             shutdown(fd, SHUT_RDWR);
@@ -284,6 +287,7 @@ static void *rx_thread(void *arg)
     int fd = pt->fd;
 
     while (frame_read(fd, &h, payload) == 1) {
+        shm_stats_add(stats, pt->id, STAT_IN, 1);
         if (forward(pt->id, &h, payload) < 0)
             break;
     }
@@ -304,7 +308,6 @@ static void *rx_thread(void *arg)
     struct pkt *left;
     while ((left = qos_pop(&pt->out, now_ms())) != NULL)
         pkt_put(left);
-    unsigned long dropped = pt->dropped;
     close(pt->fd);
     pt->fd = -1;
     pt->state = PORT_DONE;
@@ -313,7 +316,7 @@ static void *rx_thread(void *arg)
     // one more port free, wakes up a host waiting in main
     sem_post(&free_ports);
 
-    log_msg("port %d disconnected (%lu frames dropped)", pt->id, dropped);
+    log_msg("port %d disconnected", pt->id);
     return NULL;
 }
 
@@ -340,7 +343,6 @@ static int attach_host(int fd)
         qos_init(&pt->out);
         pt->rate = get_config().rate_limit;
         pt->tokens = pt->rate * 10;  // start with a full bucket
-        pt->dropped = 0;
         pthread_mutex_unlock(&pt->lock);
 
         // sender first because rx joins it when the host leaves
@@ -632,6 +634,12 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    stats = shm_stats_create(num_ports);
+    if (stats == NULL) {
+        fprintf(stderr, "could not create shared memory for stats\n");
+        return 1;
+    }
+
     if (sem_init(&free_ports, 0, (unsigned int)num_ports) != 0) {
         perror("sem_init");
         return 1;
@@ -722,6 +730,7 @@ int main(int argc, char *argv[])
         pthread_cond_destroy(&ports[p].not_empty);
     }
     sem_destroy(&free_ports);
+    shm_stats_destroy(stats);  // also removes it from /dev/shm
     mac_table_destroy(&table);
     log_msg("switch stopped cleanly");
     log_stop();
