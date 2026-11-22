@@ -88,7 +88,7 @@ host C  &lt;-->  [port 2: rx thread, tx thread]      signal thread
 
 <h2>Testing</h2>
 
-<p>"make check" runs all my tests, 3 unit tests in C and 12 tests in Python that each start a fresh switch. They test forwarding, a host that never reads, broadcast storms with hosts joining and leaving, port security, the port limit, priorities, rate limiting, VLANs, the swctl commands, mirroring, shutting down with Ctrl+C in different situations, and a stress test that runs traffic and about 30,000 random swctl commands at the same time.</p>
+<p>The tests are in the GitHub repo (they are not in the submission zip). "make check" runs all of them, 3 unit tests in C and 12 tests in Python that each start a fresh switch. They test forwarding, a host that never reads, broadcast storms with hosts joining and leaving, port security, the port limit, priorities, rate limiting, VLANs, the swctl commands, mirroring, shutting down with Ctrl+C in different situations, and a stress test that runs traffic and about 30,000 random swctl commands at the same time.</p>
 
 <p>"make tsan" and "make valgrind" run the same tests with ThreadSanitizer and valgrind. TSan found one race. At shutdown, close_all_ports() was setting a port's state back to free without locking the port, while rx threads of other ports could still be reading it. I moved that write under the port lock and after that TSan was clean. Valgrind shows no errors, no leaks and no sockets left open.</p>
 

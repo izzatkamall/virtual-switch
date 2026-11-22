@@ -10,16 +10,11 @@ port, and the switch learns MAC addresses and forwards frames between them.
 ## Building
 
 ```
-make            # builds switch, host, swctl and the unit tests
-make test       # runs the 3 C unit tests
-make check      # runs every test (unit + live), takes about a minute
-make tsan       # every test with everything built with -fsanitize=thread
-make valgrind   # every live test with the switch running under valgrind
+make            # builds switch, host and swctl
 make clean
 ```
 
 Flags are `-std=c11 -Wall -Wextra -Werror -g -O0`, needs pthreads and `-lrt`.
-`make check` needs python3.
 
 ## Running
 
@@ -27,7 +22,7 @@ Flags are `-std=c11 -Wall -Wextra -Werror -g -O0`, needs pthreads and `-lrt`.
 
 ```
 ./switch <tcp_port> <num_ports> [config_file]
-./switch 9000 4 switch.conf
+./switch 9000 4 my.conf
 ```
 
 `num_ports` is 1 to 64. The switch logs to `switch.log` and to stdout.
@@ -100,7 +95,7 @@ make the whole file fail to load (nothing is half applied).
 | `port_vlan <port> <vlan>` | 1 | puts a port in a vlan, can appear many times |
 | `trunk_port <port>` | -1 | the trunk port, carries every vlan and frames keep their vlan field |
 
-Example (`switch.conf`):
+Example:
 
 ```
 mac_age 30
@@ -159,16 +154,17 @@ src/shm_stats.c    shared memory counters
 src/switch.c       the switch
 src/host.c         test host
 src/swctl.c        admin tool
-tests/             C unit tests, python live tests, configs, run_all.sh
 ```
 
 ## Tests
 
-`make check` starts a fresh switch for each live test with the right number
-of ports and config, and stops it with SIGINT (it must exit cleanly).
-To run one by hand, for example:
+The tests are not part of the submission, they are in the repo
+(https://github.com/izzatkamall/virtual-switch) under `tests/`. From a
+clone of the repo:
 
 ```
-./switch 9200 4
-python3 tests/test_forward.py 9200
+make test       # the 3 C unit tests
+make check      # every test (unit + live, needs python3), about a minute
+make tsan       # every test with everything built with -fsanitize=thread
+make valgrind   # every live test with the switch running under valgrind
 ```

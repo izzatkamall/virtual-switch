@@ -8,7 +8,7 @@ HDRS   = $(wildcard src/*.h)
 PROGS = switch host swctl
 TESTS = test_frame_mac test_net_io test_qos
 
-all: $(PROGS) $(TESTS)
+all: $(PROGS)
 
 switch: src/switch.c src/mac_table.c src/config.c src/qos.c src/shm_stats.c $(COMMON) $(HDRS)
 	$(CC) $(CFLAGS) -o $@ src/switch.c src/mac_table.c src/config.c src/qos.c src/shm_stats.c $(COMMON) $(LIBS)
@@ -34,14 +34,14 @@ test: $(TESTS)
 	./test_qos
 
 # every test, unit and live, against fresh switches
-check: all
+check: all $(TESTS)
 	tests/run_all.sh
 
 # every test with everything built with thread sanitizer, a race makes
 # the switch exit with 66 so the test fails. rebuild normally afterwards
 tsan:
 	$(MAKE) clean
-	$(MAKE) CFLAGS="$(CFLAGS) -fsanitize=thread" all
+	$(MAKE) CFLAGS="$(CFLAGS) -fsanitize=thread" all $(TESTS)
 	TSAN_OPTIONS="exitcode=66" tests/run_all.sh
 	$(MAKE) clean
 	$(MAKE) all
@@ -49,7 +49,7 @@ tsan:
 # every live test with the switch under valgrind, any error or leak
 # makes it exit with 99 so the test fails
 VALGRIND = valgrind -q --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=all --error-exitcode=99
-valgrind: all
+valgrind: all $(TESTS)
 	RUN="$(VALGRIND)" STOP_SECS=10 tests/run_all.sh
 
 clean:
