@@ -11,6 +11,7 @@
 #include "frame.h"
 
 #define SHM_NAME "/vswitch_stats"
+#define ADMIN_SOCK "/tmp/vswitch.sock"  // swctl talks to the switch here
 
 enum {
     STAT_IN = 0,

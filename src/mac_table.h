@@ -70,6 +70,9 @@ int mac_table_age(struct mac_table *t, uint64_t max_age_ms);
 // removes every mac learned on a port, used when its host leaves
 int mac_table_remove_port(struct mac_table *t, int port);
 
+// removes everything, locks buckets in order 0 to N-1
+void mac_table_clear(struct mac_table *t);
+
 // returns the table as text (malloced, caller frees) or NULL on error
 char *mac_table_to_string(struct mac_table *t);
 

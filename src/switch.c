@@ -20,6 +20,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -98,6 +100,7 @@ static struct mac_table table;
 static struct shm_stats *stats;  // counters swctl can read
 static sem_t free_ports;  // counts ports nobody is using
 static int listen_fd = -1;
+static int admin_fd = -1;  // unix socket for swctl
 
 // settings from the config file, SIGHUP can change them while we run
 static pthread_mutex_t cfg_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -429,8 +432,10 @@ static void *signal_thread(void *arg)
             pthread_cond_broadcast(&stop_cond);  // wakes the aging thread
             pthread_mutex_unlock(&stop_lock);
 
-            // wake main if its stuck in accept or waiting for a port
+            // wake main if its stuck in accept or waiting for a port,
+            // and the admin thread out of its accept
             shutdown(listen_fd, SHUT_RDWR);
+            shutdown(admin_fd, SHUT_RDWR);
             sem_post(&free_ports);
             break;
         }
@@ -534,6 +539,152 @@ static void send_switch_full(int fd)
     h.priority = PRIO_HIGH;
     h.length = 11;
     frame_write(fd, &h, (const uint8_t *)"switch full");
+}
+
+// admin commands from swctl
+
+static const char *state_name(int state)
+{
+    switch (state) {
+    case PORT_UP: return "up";
+    case PORT_CLOSING: return "closing";
+    default: return "free";
+    }
+}
+
+static void cmd_show_ports(FILE *out)
+{
+    struct port_stats ps[MAX_PORTS];
+    shm_stats_snapshot(stats, ps);
+
+    fprintf(out, "%-5s %-8s %-6s %-5s %-10s %-10s %-10s %-10s\n",
+            "PORT", "STATE", "VLAN", "MACS", "IN", "OUT", "DROPPED", "MIRRORED");
+    for (int p = 0; p < num_ports; p++) {
+        struct port *pt = &ports[p];
+        pthread_mutex_lock(&pt->lock);
+        int state = pt->state;
+        int vlan = pt->vlan;
+        int trunk = pt->trunk;
+        pthread_mutex_unlock(&pt->lock);
+
+        char vl[8];
+        if (trunk)
+            snprintf(vl, sizeof(vl), "trunk");
+        else
+            snprintf(vl, sizeof(vl), "%d", vlan);
+
+        fprintf(out, "%-5d %-8s %-6s %-5d %-10lu %-10lu %-10lu %-10lu\n",
+                p, state_name(state), vl, mac_table_port_count(&table, p),
+                ps[p].count[STAT_IN], ps[p].count[STAT_OUT],
+                ps[p].count[STAT_DROPPED], ps[p].count[STAT_MIRRORED]);
+    }
+}
+
+// runs one command and writes the reply into out
+static void run_command(char *cmd, FILE *out)
+{
+    cmd[strcspn(cmd, "\r\n")] = '\0';
+
+    if (strcmp(cmd, "show mac") == 0) {
+        char *text = mac_table_to_string(&table);
+        if (text == NULL) {
+            fprintf(out, "error building mac table\n");
+            return;
+        }
+        fputs(text, out);
+        free(text);
+    } else if (strcmp(cmd, "show ports") == 0) {
+        cmd_show_ports(out);
+    } else if (strcmp(cmd, "clear mac") == 0) {
+        mac_table_clear(&table);
+        log_msg("mac table cleared by swctl");
+        fprintf(out, "mac table cleared\n");
+    } else {
+        fprintf(out, "unknown command: %s\n", cmd);
+    }
+}
+
+// reads one command from swctl, runs it, sends back the reply
+static void handle_admin_client(int fd)
+{
+    // swctl that hangs shouldnt be able to hang the admin thread
+    struct timeval tv = {2, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    char cmd[256];
+    size_t got = 0;
+    while (got < sizeof(cmd) - 1) {
+        ssize_t n = read(fd, cmd + got, sizeof(cmd) - 1 - got);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            break;
+        got += n;
+        if (memchr(cmd, '\n', got) != NULL)
+            break;
+    }
+    cmd[got] = '\0';
+    if (got == 0)
+        return;
+
+    // build the reply in memory, then send it in one go
+    char *reply = NULL;
+    size_t len = 0;
+    FILE *out = open_memstream(&reply, &len);
+    if (out == NULL)
+        return;
+    run_command(cmd, out);
+    if (fclose(out) == 0)
+        write_full(fd, reply, len);
+    free(reply);
+}
+
+static void *admin_thread(void *arg)
+{
+    (void)arg;
+    while (1) {
+        int fd = accept(admin_fd, NULL, NULL);
+        if (fd < 0) {
+            if (is_stopping())
+                break;
+            if (errno == EINTR)
+                continue;
+            log_msg("admin accept: %s", strerror(errno));
+            break;
+        }
+        handle_admin_client(fd);
+        close(fd);
+    }
+    return NULL;
+}
+
+static int make_admin_socket(void)
+{
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        perror("admin socket");
+        return -1;
+    }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, ADMIN_SOCK, sizeof(addr.sun_path) - 1);
+
+    unlink(ADMIN_SOCK);  // left over from a crash
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("admin bind");
+        close(fd);
+        return -1;
+    }
+    if (listen(fd, 8) < 0) {
+        perror("admin listen");
+        close(fd);
+        unlink(ADMIN_SOCK);
+        return -1;
+    }
+    return fd;
 }
 
 static int make_listen_socket(int tcp_port)
@@ -649,9 +800,19 @@ int main(int argc, char *argv[])
     if (listen_fd < 0)
         return 1;
 
+    admin_fd = make_admin_socket();
+    if (admin_fd < 0)
+        return 1;
+
     pthread_t sig_tid;
     if (pthread_create(&sig_tid, NULL, signal_thread, &set) != 0) {
         fprintf(stderr, "could not start signal thread\n");
+        return 1;
+    }
+
+    pthread_t admin_tid;
+    if (pthread_create(&admin_tid, NULL, admin_thread, NULL) != 0) {
+        fprintf(stderr, "could not start admin thread\n");
         return 1;
     }
 
@@ -715,6 +876,10 @@ int main(int argc, char *argv[])
     pthread_cond_broadcast(&stop_cond);
     pthread_mutex_unlock(&stop_lock);
 
+    // admin goes first so no swctl command touches ports while we close them
+    shutdown(admin_fd, SHUT_RDWR);
+    pthread_join(admin_tid, NULL);
+
     close_all_ports();
     pthread_join(aging_tid, NULL);
     pthread_join(rate_tid, NULL);
@@ -725,6 +890,8 @@ int main(int argc, char *argv[])
 
     // nothing else is running now, free everything
     close(listen_fd);
+    close(admin_fd);
+    unlink(ADMIN_SOCK);
     for (int p = 0; p < num_ports; p++) {
         pthread_mutex_destroy(&ports[p].lock);
         pthread_cond_destroy(&ports[p].not_empty);

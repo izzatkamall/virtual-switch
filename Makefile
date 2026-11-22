@@ -5,13 +5,16 @@ LIBS   = -pthread -lrt
 COMMON = src/frame.c src/net_io.c src/log.c
 HDRS   = $(wildcard src/*.h)
 
-PROGS = switch host
+PROGS = switch host swctl
 TESTS = test_frame_mac test_net_io test_qos
 
 all: $(PROGS) $(TESTS)
 
 switch: src/switch.c src/mac_table.c src/config.c src/qos.c src/shm_stats.c $(COMMON) $(HDRS)
 	$(CC) $(CFLAGS) -o $@ src/switch.c src/mac_table.c src/config.c src/qos.c src/shm_stats.c $(COMMON) $(LIBS)
+
+swctl: src/swctl.c src/shm_stats.c src/net_io.c src/frame.c $(HDRS)
+	$(CC) $(CFLAGS) -o $@ src/swctl.c src/shm_stats.c src/net_io.c src/frame.c $(LIBS)
 
 host: src/host.c $(COMMON) $(HDRS)
 	$(CC) $(CFLAGS) -o $@ src/host.c $(COMMON) $(LIBS)

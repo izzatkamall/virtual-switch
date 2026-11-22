@@ -362,3 +362,30 @@ char *mac_table_to_string(struct mac_table *t)
     }
     return buf;
 }
+
+void mac_table_clear(struct mac_table *t)
+{
+    // needs every bucket at once, so always lock in ascending order,
+    // anyone else who ever holds more than one does the same
+    for (int i = 0; i < MAC_TABLE_BUCKETS; i++)
+        pthread_mutex_lock(&t->buckets[i].lock);
+
+    for (int i = 0; i < MAC_TABLE_BUCKETS; i++) {
+        struct mac_entry *e = t->buckets[i].head;
+        while (e != NULL) {
+            struct mac_entry *next = e->next;
+            free(e);
+            e = next;
+        }
+        t->buckets[i].head = NULL;
+    }
+
+    // count_lock comes after the bucket locks like everywhere else
+    pthread_mutex_lock(&t->count_lock);
+    t->count = 0;
+    memset(t->per_port, 0, sizeof(t->per_port));
+    pthread_mutex_unlock(&t->count_lock);
+
+    for (int i = MAC_TABLE_BUCKETS - 1; i >= 0; i--)
+        pthread_mutex_unlock(&t->buckets[i].lock);
+}
