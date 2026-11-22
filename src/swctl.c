@@ -76,9 +76,13 @@ static int send_command(const char *cmd)
             perror("read");
             break;
         }
-        fwrite(buf, 1, n, stdout);
+        if (fwrite(buf, 1, n, stdout) != (size_t)n) {
+            perror("stdout");
+            break;
+        }
     }
-    close(fd);
+    if (close(fd) < 0)
+        perror("close");
     return 0;
 }
 

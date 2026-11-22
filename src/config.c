@@ -97,7 +97,8 @@ int config_load(const char *path, struct config *c)
         log_msg("%s: read error", path);
         bad = 1;
     }
-    fclose(f);
+    if (fclose(f) != 0)
+        bad = 1;
 
     if (bad)
         return -1;

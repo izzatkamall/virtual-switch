@@ -47,6 +47,45 @@
 #define DRAIN_SECS 2  // swctl shutdown waits this long for a queue to drain
 #define SEND_BUF_SIZE 8192  // kernel send buffer per host, linux doubles it
 
+// small wrappers so every return value gets checked in one place
+// failures here cant be fixed so we just log them and carry on
+
+static void close_fd(int fd)
+{
+    if (close(fd) < 0)
+        log_msg("close fd %d: %s", fd, strerror(errno));
+}
+
+// ENOTCONN just means the host already hung up
+static void shutdown_fd(int fd)
+{
+    if (shutdown(fd, SHUT_RDWR) < 0 && errno != ENOTCONN)
+        log_msg("shutdown fd %d: %s", fd, strerror(errno));
+}
+
+static void join_thread(pthread_t tid)
+{
+    int err = pthread_join(tid, NULL);
+    if (err != 0)
+        log_msg("pthread_join: %s", strerror(err));
+}
+
+// unlink fails with ENOENT when there was nothing to remove, thats fine
+static void remove_admin_sock(void)
+{
+    if (unlink(ADMIN_SOCK) < 0 && errno != ENOENT)
+        log_msg("unlink %s: %s", ADMIN_SOCK, strerror(errno));
+}
+
+static void get_time(struct timespec *ts)
+{
+    if (clock_gettime(CLOCK_REALTIME, ts) != 0) {
+        log_msg("clock_gettime: %s", strerror(errno));
+        ts->tv_sec = 0;
+        ts->tv_nsec = 0;
+    }
+}
+
 // one received frame, shared by every queue it goes into
 // refs counts how many queues still hold it, the last one frees it
 struct pkt {
@@ -119,6 +158,13 @@ static sem_t free_ports;  // counts ports nobody is using
 static int listen_fd = -1;
 static int admin_fd = -1;  // unix socket for swctl
 
+// gives one port back to hosts waiting in wait_for_port
+static void post_free_port(void)
+{
+    if (sem_post(&free_ports) < 0)
+        log_msg("sem_post: %s", strerror(errno));
+}
+
 // settings from the config file, SIGHUP can change them while we run
 static pthread_mutex_t cfg_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct config cfg;
@@ -180,7 +226,7 @@ static int stopping = 0;
 static struct timespec deadline_in(int ms)
 {
     struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
+    get_time(&ts);
     ts.tv_sec += ms / 1000;
     ts.tv_nsec += (long)(ms % 1000) * 1000000;
     if (ts.tv_nsec >= 1000000000) {
@@ -323,7 +369,7 @@ static void *tx_thread(void *arg)
         if (qos_count(&pt->out) == 0) {
             // drained, hang up so the rx thread cleans up
             pthread_mutex_unlock(&pt->lock);
-            shutdown(fd, SHUT_RDWR);
+            shutdown_fd(fd);
             break;
         }
         if (pt->rate > 0)
@@ -338,7 +384,7 @@ static void *tx_thread(void *arg)
             shm_stats_add(stats, pt->id, STAT_OUT, 1);
         if (rc < 0) {
             // host is gone, wake up the rx thread so it cleans up
-            shutdown(fd, SHUT_RDWR);
+            shutdown_fd(fd);
             break;
         }
     }
@@ -366,15 +412,15 @@ static void *rx_thread(void *arg)
     pt->state = PORT_CLOSING;
     pthread_cond_broadcast(&pt->not_empty);
     pthread_mutex_unlock(&pt->lock);
-    shutdown(fd, SHUT_RDWR);
-    pthread_join(pt->tx_tid, NULL);
+    shutdown_fd(fd);
+    join_thread(pt->tx_tid);
 
     // both threads are done with the fd now
     pthread_mutex_lock(&pt->lock);
     struct pkt *left;
     while ((left = qos_pop(&pt->out, now_ms())) != NULL)
         pkt_put(left);
-    close(pt->fd);
+    close_fd(pt->fd);
     pt->fd = -1;
     pt->state = PORT_DONE;
     pt->draining = 0;
@@ -384,7 +430,7 @@ static void *rx_thread(void *arg)
 
     // one more port free, wakes up a host waiting in main
     if (give_back)
-        sem_post(&free_ports);
+        post_free_port();
 
     log_msg("port %d disconnected", pt->id);
     return NULL;
@@ -408,7 +454,7 @@ static int attach_host(int fd)
 
         // old receiver already finished, join it before reusing the port
         if (state == PORT_DONE)
-            pthread_join(pt->rx_tid, NULL);
+            join_thread(pt->rx_tid);
 
         pthread_mutex_lock(&pt->lock);
         pt->fd = fd;
@@ -433,7 +479,7 @@ static int attach_host(int fd)
             pt->fd = -1;
             pthread_cond_broadcast(&pt->not_empty);
             pthread_mutex_unlock(&pt->lock);
-            pthread_join(pt->tx_tid, NULL);
+            join_thread(pt->tx_tid);
             return -2;
         }
         return p;
@@ -462,7 +508,8 @@ static void dump_mac_table(void)
         free(text);
         return;
     }
-    fputs(text, f);
+    if (fputs(text, f) == EOF)
+        log_msg("writing %s failed", DUMP_FILE);
     if (fclose(f) != 0)
         log_msg("fclose %s: %s", DUMP_FILE, strerror(errno));
     free(text);
@@ -504,9 +551,9 @@ static void *signal_thread(void *arg)
 
             // wake main if its stuck in accept or waiting for a port,
             // and the admin thread out of its accept
-            shutdown(listen_fd, SHUT_RDWR);
-            shutdown(admin_fd, SHUT_RDWR);
-            sem_post(&free_ports);
+            shutdown_fd(listen_fd);
+            shutdown_fd(admin_fd);
+            post_free_port();
             break;
         }
     }
@@ -521,13 +568,13 @@ static void close_all_ports(void)
         struct port *pt = &ports[p];
         pthread_mutex_lock(&pt->lock);
         if (pt->state == PORT_UP)
-            shutdown(pt->fd, SHUT_RDWR);
+            shutdown_fd(pt->fd);
         int started = pt->state != PORT_FREE;
         pthread_mutex_unlock(&pt->lock);
 
         // every port that isnt FREE has an rx thread nobody joined yet
         if (started) {
-            pthread_join(pt->rx_tid, NULL);
+            join_thread(pt->rx_tid);
             pt->state = PORT_FREE;
         }
     }
@@ -589,7 +636,7 @@ static void *aging_thread(void *arg)
 static int wait_for_port(void)
 {
     struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
+    get_time(&ts);
     ts.tv_sec += get_config().port_wait;
 
     while (sem_timedwait(&free_ports, &ts) < 0) {
@@ -608,7 +655,8 @@ static void send_switch_full(int fd)
     h.vlan = 1;
     h.priority = PRIO_HIGH;
     h.length = 11;
-    frame_write(fd, &h, (const uint8_t *)"switch full");
+    if (frame_write(fd, &h, (const uint8_t *)"switch full") < 0)
+        log_msg("could not send switch full: %s", strerror(errno));
 }
 
 // admin commands from swctl
@@ -679,7 +727,7 @@ static void cmd_shutdown(int p, FILE *out)
             // host isnt reading, stop waiting and cut it off
             fprintf(out, "port %d did not drain in %ds, dropping the rest\n", p, DRAIN_SECS);
             if (pt->state == PORT_UP)
-                shutdown(pt->fd, SHUT_RDWR);
+                shutdown_fd(pt->fd);
             while (pt->state != PORT_DONE)
                 pthread_cond_wait(&pt->done, &pt->lock);
         }
@@ -702,7 +750,7 @@ static void cmd_shutdown(int p, FILE *out)
     // rx thread has finished, nobody else joins it since the port is
     // disabled and we hold attach_lock
     if (must_join)
-        pthread_join(pt->rx_tid, NULL);
+        join_thread(pt->rx_tid);
     pthread_mutex_unlock(&attach_lock);
 
     log_msg("port %d shut down by swctl", p);
@@ -720,7 +768,7 @@ static void cmd_up(int p, FILE *out)
 
     // shutdown always leaves the port FREE, so its free again now
     if (!was)
-        sem_post(&free_ports);
+        post_free_port();
     pthread_mutex_unlock(&attach_lock);
 
     if (was) {
@@ -816,8 +864,11 @@ static void handle_admin_client(int fd)
 {
     // swctl that hangs shouldnt be able to hang the admin thread
     struct timeval tv = {2, 0};
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0 ||
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0) {
+        log_msg("admin setsockopt: %s", strerror(errno));
+        return;
+    }
 
     char cmd[256];
     size_t got = 0;
@@ -843,7 +894,8 @@ static void handle_admin_client(int fd)
         return;
     run_command(cmd, out);
     if (fclose(out) == 0)
-        write_full(fd, reply, len);
+        if (write_full(fd, reply, len) < 0)
+            log_msg("admin reply: %s", strerror(errno));
     free(reply);
 }
 
@@ -861,7 +913,7 @@ static void *admin_thread(void *arg)
             break;
         }
         handle_admin_client(fd);
-        close(fd);
+        close_fd(fd);
     }
     return NULL;
 }
@@ -879,16 +931,16 @@ static int make_admin_socket(void)
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, ADMIN_SOCK, sizeof(addr.sun_path) - 1);
 
-    unlink(ADMIN_SOCK);  // left over from a crash
+    remove_admin_sock();  // left over from a crash
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("admin bind");
-        close(fd);
+        close_fd(fd);
         return -1;
     }
     if (listen(fd, 8) < 0) {
         perror("admin listen");
-        close(fd);
-        unlink(ADMIN_SOCK);
+        close_fd(fd);
+        remove_admin_sock();
         return -1;
     }
     return fd;
@@ -914,12 +966,12 @@ static int make_listen_socket(int tcp_port)
 
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("bind");
-        close(fd);
+        close_fd(fd);
         return -1;
     }
     if (listen(fd, 16) < 0) {
         perror("listen");
-        close(fd);
+        close_fd(fd);
         return -1;
     }
     return fd;
@@ -1055,13 +1107,13 @@ int main(int argc, char *argv[])
         // all ports busy, wait a bit for one to free up
         int got_port = wait_for_port();
         if (is_stopping()) {
-            close(fd);
+            close_fd(fd);
             break;
         }
         if (got_port < 0) {
             log_msg("switch full, sending a new host away");
             send_switch_full(fd);
-            close(fd);
+            close_fd(fd);
             continue;
         }
 
@@ -1079,11 +1131,11 @@ int main(int argc, char *argv[])
             // went with it so dont give it back
             log_msg("switch full, sending a new host away");
             send_switch_full(fd);
-            close(fd);
+            close_fd(fd);
         } else if (p < 0) {
             log_msg("could not attach host");
-            sem_post(&free_ports);  // give the slot back
-            close(fd);
+            post_free_port();  // give the slot back
+            close_fd(fd);
         } else {
             log_msg("host connected on port %d", p);
         }
@@ -1096,27 +1148,30 @@ int main(int argc, char *argv[])
     pthread_mutex_unlock(&stop_lock);
 
     // admin goes first so no swctl command touches ports while we close them
-    shutdown(admin_fd, SHUT_RDWR);
-    pthread_join(admin_tid, NULL);
+    shutdown_fd(admin_fd);
+    join_thread(admin_tid);
 
     close_all_ports();
-    pthread_join(aging_tid, NULL);
-    pthread_join(rate_tid, NULL);
+    join_thread(aging_tid);
+    join_thread(rate_tid);
 
     // signal thread might still be in sigwait if we got here without SIGINT
-    pthread_kill(sig_tid, SIGINT);
-    pthread_join(sig_tid, NULL);
+    int err = pthread_kill(sig_tid, SIGINT);
+    if (err != 0)
+        log_msg("pthread_kill: %s", strerror(err));
+    join_thread(sig_tid);
 
     // nothing else is running now, free everything
-    close(listen_fd);
-    close(admin_fd);
-    unlink(ADMIN_SOCK);
+    close_fd(listen_fd);
+    close_fd(admin_fd);
+    remove_admin_sock();
     for (int p = 0; p < num_ports; p++) {
         pthread_mutex_destroy(&ports[p].lock);
         pthread_cond_destroy(&ports[p].not_empty);
         pthread_cond_destroy(&ports[p].done);
     }
-    sem_destroy(&free_ports);
+    if (sem_destroy(&free_ports) < 0)
+        log_msg("sem_destroy: %s", strerror(errno));
     shm_stats_destroy(stats);  // also removes it from /dev/shm
     mac_table_destroy(&table);
     log_msg("switch stopped cleanly");

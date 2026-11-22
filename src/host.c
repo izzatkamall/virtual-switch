@@ -146,8 +146,11 @@ int main(int argc, char *argv[])
 
     // stdin is done, tell the switch we wont send more but keep reading
     // until it closes, so replies still get printed
-    shutdown(sock, SHUT_WR);
-    pthread_join(tid, NULL);
-    close(sock);
+    if (shutdown(sock, SHUT_WR) < 0)
+        perror("shutdown");
+    if (pthread_join(tid, NULL) != 0)
+        fprintf(stderr, "could not join receive thread\n");
+    if (close(sock) < 0)
+        perror("close");
     return 0;
 }

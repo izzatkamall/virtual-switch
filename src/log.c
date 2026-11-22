@@ -101,7 +101,8 @@ int log_start(const char *path)
 void log_msg(const char *fmt, ...)
 {
     struct log_line l;
-    clock_gettime(CLOCK_REALTIME, &l.when);
+    if (clock_gettime(CLOCK_REALTIME, &l.when) != 0)
+        memset(&l.when, 0, sizeof(l.when));  // no time, still log it
 
     // format before locking so the lock is held for a tiny moment
     va_list ap;
@@ -136,7 +137,9 @@ void log_stop(void)
     pthread_cond_broadcast(&not_empty);
     pthread_mutex_unlock(&lock);
 
-    pthread_join(logger_tid, NULL);
+    int err = pthread_join(logger_tid, NULL);
+    if (err != 0)
+        fprintf(stderr, "pthread_join logger: %s\n", strerror(err));
     if (fclose(log_file) != 0)
         perror("fclose log");
     log_file = NULL;

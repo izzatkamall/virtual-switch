@@ -2,6 +2,7 @@
 
 #include "shm_stats.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
@@ -13,8 +14,9 @@ struct shm_stats *shm_stats_create(int num_ports)
     if (num_ports < 1 || num_ports > MAX_PORTS)
         return NULL;
 
-    // get rid of an old one left behind by a crash
-    shm_unlink(SHM_NAME);
+    // get rid of an old one left behind by a crash, ENOENT means there wasnt one
+    if (shm_unlink(SHM_NAME) < 0 && errno != ENOENT)
+        perror("shm_unlink old");
 
     int fd = shm_open(SHM_NAME, O_CREAT | O_EXCL | O_RDWR, 0666);
     if (fd < 0) {
@@ -29,7 +31,8 @@ struct shm_stats *shm_stats_create(int num_ports)
     }
 
     struct shm_stats *s = mmap(NULL, sizeof(*s), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    close(fd);  // the mapping stays valid after close
+    if (close(fd) < 0)  // the mapping stays valid after close
+        perror("close");
     if (s == MAP_FAILED) {
         perror("mmap");
         shm_unlink(SHM_NAME);
@@ -76,7 +79,8 @@ struct shm_stats *shm_stats_attach(void)
         return NULL;
 
     struct shm_stats *s = mmap(NULL, sizeof(*s), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    close(fd);
+    if (close(fd) < 0)
+        perror("close");
     if (s == MAP_FAILED)
         return NULL;
     return s;
