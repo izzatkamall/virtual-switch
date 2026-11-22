@@ -33,6 +33,10 @@ test: $(TESTS)
 	./test_net_io
 	./test_qos
 
+# every test, unit and live, against fresh switches
+check: all
+	tests/run_all.sh
+
 # needs libtsan installed
 tsan:
 	$(MAKE) clean
@@ -41,4 +45,4 @@ tsan:
 clean:
 	rm -f $(PROGS) $(TESTS)
 
-.PHONY: all test tsan clean
+.PHONY: all test check tsan clean
