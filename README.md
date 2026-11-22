@@ -2,6 +2,8 @@
 
 OS Fall 2026 project, Muhammad Izzat Kamal (BSAI24078)
 
+Repo: https://github.com/izzatkamall/virtual-switch
+
 A multithreaded layer 2 switch in C. Hosts connect over TCP, each one gets a
 port, and the switch learns MAC addresses and forwards frames between them.
 
