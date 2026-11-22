@@ -52,7 +52,8 @@ def admin():
     while time.time() < stop:
         p = str(random.randrange(NPORTS))
         cmd = random.choice([["shutdown", p], ["up", p], ["up", p], ["vlan", p, str(random.choice([1, 1, 2]))],
-                             ["clear", "mac"], ["show", "mac"], ["show", "ports"]])
+                             ["clear", "mac"], ["show", "mac"], ["show", "ports"],
+                             ["mirror", p, str(random.randrange(NPORTS))], ["mirror", p, "off"]])
         swctl(*cmd)
         with lock:
             counts["cmds"] += 1
@@ -67,6 +68,7 @@ print("frames %(frames)d, swctl commands %(cmds)d, short lived hosts %(churn)d" 
 
 # put everything back: all ports up, vlan 1, then wait for hosts to leave
 for p in range(NPORTS):
+    swctl("mirror", str(p), "off")
     swctl("up", str(p))
     swctl("vlan", str(p), "1")
 time.sleep(1.5)

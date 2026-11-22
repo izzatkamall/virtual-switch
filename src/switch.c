@@ -99,6 +99,7 @@ struct port {
 
     int vlan;   // vlan of an access port
     int trunk;  // 1 if this port carries every vlan
+    int mirror_to;  // sniffer port that gets a copy of our traffic, -1 for none
 
     // token bucket, in tenths of a frame so slow rates still work
     // with 100ms ticks. rate 0 means no limit
@@ -189,6 +190,29 @@ static struct timespec deadline_in(int ms)
     return ts;
 }
 
+// gives a copy of a frame to a sniffer port, never blocks
+// the copy is the same shared pkt so nothing gets copied, and vlans
+// dont matter, the sniffer sees everything from the mirrored port
+static void mirror_frame(int from, int sniffer, struct pkt *k)
+{
+    struct port *sp = &ports[sniffer];
+    int ok = 0;
+
+    pthread_mutex_lock(&sp->lock);
+    if (sp->state == PORT_UP && !sp->draining &&
+        qos_push(&sp->out, k->h.priority, k, now_ms()) == 0) {
+        pkt_get(k);
+        pthread_cond_signal(&sp->not_empty);
+        ok = 1;
+    }
+    pthread_mutex_unlock(&sp->lock);
+
+    if (ok)
+        shm_stats_add(stats, from, STAT_MIRRORED, 1);
+    else
+        shm_stats_add(stats, sniffer, STAT_DROPPED, 1);  // slow sniffer only loses copies
+}
+
 // puts a frame on a port queue, never blocks
 // returns 1 if queued, 0 if the queue was full (dropped and counted),
 // -1 if the port is down or not in the frame's vlan
@@ -208,7 +232,13 @@ static int port_enqueue(int p, struct pkt *k)
         pthread_cond_signal(&pt->not_empty);
         rc = 1;
     }
+    int mirror = pt->mirror_to;
     pthread_mutex_unlock(&pt->lock);
+
+    // frames going out of a mirrored port, done after unlocking since
+    // we never hold two port locks
+    if (rc == 1 && mirror >= 0)
+        mirror_frame(p, mirror, k);
     return rc;
 }
 
@@ -222,6 +252,7 @@ static int forward(int in_port, struct frame_header *h, const uint8_t *payload)
     if (!in->trunk)
         h->vlan = (uint16_t)in->vlan;
     int draining = in->draining;
+    int mirror = in->mirror_to;
     pthread_mutex_unlock(&in->lock);
 
     if (draining)
@@ -243,6 +274,10 @@ static int forward(int in_port, struct frame_header *h, const uint8_t *payload)
     struct pkt *k = pkt_new(h, payload);
     if (k == NULL)
         return 0;
+
+    // frames coming in on a mirrored port
+    if (mirror >= 0)
+        mirror_frame(in_port, mirror, k);
 
     // known dest, unless its in another vlan, then treat it as unknown
     if (out < 0 || port_enqueue(out, k) < 0) {
@@ -734,6 +769,30 @@ static void run_command(char *cmd, FILE *out)
             cmd_shutdown(p, out);
         else
             cmd_up(p, out);
+    } else if (strncmp(cmd, "mirror ", 7) == 0) {
+        char ps[16], ss[16], extra[4];
+        int p = -1, sniffer = -2;
+        if (sscanf(cmd + 7, "%15s %15s %3s", ps, ss, extra) == 2) {
+            p = parse_port(ps);
+            if (strcmp(ss, "off") == 0)
+                sniffer = -1;
+            else if (parse_port(ss) >= 0)
+                sniffer = parse_port(ss);
+        }
+        if (p < 0 || sniffer < -1 || sniffer == p) {
+            fprintf(out, "usage: mirror <port> <sniffer_port|off>, two different ports 0-%d\n", num_ports - 1);
+        } else {
+            pthread_mutex_lock(&ports[p].lock);
+            ports[p].mirror_to = sniffer;
+            pthread_mutex_unlock(&ports[p].lock);
+            if (sniffer < 0) {
+                log_msg("mirroring of port %d stopped", p);
+                fprintf(out, "port %d is not mirrored\n", p);
+            } else {
+                log_msg("port %d mirrored to port %d", p, sniffer);
+                fprintf(out, "port %d is mirrored to port %d\n", p, sniffer);
+            }
+        }
     } else if (strncmp(cmd, "vlan ", 5) == 0) {
         char ps[16], vs[16], extra[4];
         int vlan;
@@ -918,6 +977,7 @@ int main(int argc, char *argv[])
         ports[p].trunk = 0;
         ports[p].enabled = 1;
         ports[p].draining = 0;
+        ports[p].mirror_to = -1;
         if (pthread_mutex_init(&ports[p].lock, NULL) != 0 ||
             pthread_cond_init(&ports[p].not_empty, NULL) != 0 ||
             pthread_cond_init(&ports[p].done, NULL) != 0) {

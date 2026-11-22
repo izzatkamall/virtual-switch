@@ -6,7 +6,7 @@
 //   ./swctl shutdown <port>
 //   ./swctl up <port>
 //   ./swctl vlan <port> <vlan>
-//   ./swctl mirror <port> <sniffer_port>
+//   ./swctl mirror <port> <sniffer_port|off>
 //   ./swctl stats [--watch]
 //
 // stats reads the shared memory directly, everything else is sent to
@@ -34,7 +34,7 @@ static void usage(void)
                     "  swctl shutdown <port>\n"
                     "  swctl up <port>\n"
                     "  swctl vlan <port> <vlan>\n"
-                    "  swctl mirror <port> <sniffer_port>\n"
+                    "  swctl mirror <port> <sniffer_port|off>\n"
                     "  swctl stats [--watch]\n");
 }
 
