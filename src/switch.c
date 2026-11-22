@@ -573,9 +573,13 @@ static void close_all_ports(void)
         pthread_mutex_unlock(&pt->lock);
 
         // every port that isnt FREE has an rx thread nobody joined yet
+        // other ports rx threads may still be sending to this port,
+        // so state is only changed under the lock
         if (started) {
             join_thread(pt->rx_tid);
+            pthread_mutex_lock(&pt->lock);
             pt->state = PORT_FREE;
+            pthread_mutex_unlock(&pt->lock);
         }
     }
 }
