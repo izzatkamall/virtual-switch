@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Virtual Switch Report</title>
+<style>
+  @page { size: A4; margin: 15mm 16mm; }
+  body { font-family: "DejaVu Serif", Georgia, serif; font-size: 10pt; line-height: 1.35; color: #111; background: #fff; margin: 0; }
+  h1 { font-size: 15pt; margin: 0 0 2px; }
+  .sub { color: #444; margin-bottom: 10px; }
+  h2 { font-size: 11.5pt; margin: 12px 0 4px; border-bottom: 1px solid #999; padding-bottom: 1px; }
+  h3 { font-size: 10.5pt; margin: 8px 0 3px; }
+  p { margin: 3px 0 6px; }
+  code { font-family: "DejaVu Sans Mono", monospace; font-size: 8.8pt; }
+  table { border-collapse: collapse; width: 100%; margin: 4px 0 8px; font-size: 9pt; }
+  th, td { border: 1px solid #888; padding: 2px 5px; text-align: left; vertical-align: top; }
+  th { background: #e8e8e8; }
+  ul, ol { margin: 2px 0 6px; padding-left: 20px; }
+  li { margin: 1px 0; }
+  .fig { text-align: center; margin: 4px 0 2px; }
+  .cap { text-align: center; font-size: 8.8pt; color: #333; margin-bottom: 6px; }
+  .todo { background: #fff3b0; padding: 1px 3px; }
+  .avoid { break-inside: avoid; }
+</style>
+</head>
+<body>
+
+<h1>Virtual Switch: Project Report</h1>
+<div class="sub">Operating Systems, Fall 2026 &middot; Muhammad Izzat Kamal (BSAI24078)</div>
+
+<h2>1. Overview</h2>
+<p>The switch is one process (<code>./switch port n [config]</code>). Hosts connect over TCP and each gets one of
+<code>n</code> ports. Frames use the fixed 17 byte header. The switch learns source MACs, forwards to the learned port,
+and floods broadcasts and unknown destinations inside the VLAN. A separate process, <code>swctl</code>, talks to the
+switch over a UNIX socket and reads live counters from shared memory. Every thread sleeps on a condition variable,
+semaphore, <code>sigwait</code> or a blocking socket call, so nothing busy waits. Periodic work (aging, token refill)
+uses <code>pthread_cond_timedwait</code> on a stop condition so shutdown wakes it straight away.</p>
+
+<h2>2. Threads</h2>
+<div class="fig">
+<svg width="660" height="270" viewBox="0 0 660 270" xmlns="http://www.w3.org/2000/svg" font-family="DejaVu Sans, sans-serif" font-size="10">
+  <defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#333"/></marker></defs>
+  <!-- switch process box -->
+  <rect x="120" y="8" width="410" height="254" fill="none" stroke="#333" stroke-dasharray="5,3"/>
+  <text x="128" y="22" font-weight="bold">switch process</text>
+
+  <!-- hosts -->
+  <rect x="8" y="60" width="80" height="30" fill="#f2f2f2" stroke="#333"/><text x="48" y="79" text-anchor="middle">host A</text>
+  <rect x="8" y="140" width="80" height="30" fill="#f2f2f2" stroke="#333"/><text x="48" y="159" text-anchor="middle">host B</text>
+  <rect x="8" y="215" width="80" height="30" fill="#f2f2f2" stroke="#333"/><text x="48" y="234" text-anchor="middle">new host</text>
+
+  <!-- main -->
+  <rect x="140" y="215" width="120" height="34" fill="#fff" stroke="#333"/><text x="200" y="229" text-anchor="middle" font-weight="bold">main</text><text x="200" y="243" text-anchor="middle">accept, wait free port</text>
+  <line x1="88" y1="230" x2="138" y2="230" stroke="#333" marker-end="url(#a)"/>
+
+  <!-- port 0 -->
+  <rect x="140" y="35" width="250" height="70" fill="#fafafa" stroke="#333"/><text x="148" y="48" font-weight="bold">port 0</text>
+  <rect x="150" y="55" width="62" height="40" fill="#fff" stroke="#333"/><text x="181" y="72" text-anchor="middle">rx</text><text x="181" y="86" text-anchor="middle" font-size="8.5">read, learn</text>
+  <rect x="225" y="55" width="90" height="40" fill="#fff" stroke="#333"/><text x="270" y="69" text-anchor="middle">qos queues</text><text x="270" y="83" text-anchor="middle" font-size="8.5">H / N / L</text>
+  <rect x="325" y="55" width="55" height="40" fill="#fff" stroke="#333"/><text x="352" y="72" text-anchor="middle">tx</text><text x="352" y="86" text-anchor="middle" font-size="8.5">WRR, tokens</text>
+  <line x1="315" y1="75" x2="323" y2="75" stroke="#333" marker-end="url(#a)"/>
+
+  <!-- port 1 -->
+  <rect x="140" y="120" width="250" height="70" fill="#fafafa" stroke="#333"/><text x="148" y="133" font-weight="bold">port 1</text>
+  <rect x="150" y="140" width="62" height="40" fill="#fff" stroke="#333"/><text x="181" y="157" text-anchor="middle">rx</text><text x="181" y="171" text-anchor="middle" font-size="8.5">read, learn</text>
+  <rect x="225" y="140" width="90" height="40" fill="#fff" stroke="#333"/><text x="270" y="154" text-anchor="middle">qos queues</text><text x="270" y="168" text-anchor="middle" font-size="8.5">H / N / L</text>
+  <rect x="325" y="140" width="55" height="40" fill="#fff" stroke="#333"/><text x="352" y="157" text-anchor="middle">tx</text><text x="352" y="171" text-anchor="middle" font-size="8.5">WRR, tokens</text>
+  <line x1="315" y1="160" x2="323" y2="160" stroke="#333" marker-end="url(#a)"/>
+
+  <!-- host links -->
+  <line x1="88" y1="70" x2="148" y2="70" stroke="#333" marker-end="url(#a)"/>
+  <path d="M380,88 C410,88 410,112 100,112 L90,85" fill="none" stroke="#333" marker-end="url(#a)"/>
+  <line x1="88" y1="150" x2="148" y2="150" stroke="#333" marker-end="url(#a)"/>
+  <path d="M380,173 C410,173 410,198 100,198 L90,168" fill="none" stroke="#333" marker-end="url(#a)"/>
+  <!-- rx of port 0 forwards into port 1 queue -->
+  <path d="M200,95 L255,138" fill="none" stroke="#666" stroke-dasharray="3,2" marker-end="url(#a)"/>
+
+  <!-- shared data -->
+  <rect x="270" y="215" width="120" height="34" fill="#f2f2f2" stroke="#333"/><text x="330" y="229" text-anchor="middle">MAC table</text><text x="330" y="243" text-anchor="middle" font-size="8.5">16 locked buckets</text>
+
+  <!-- service threads -->
+  <rect x="405" y="35" width="115" height="30" fill="#fff" stroke="#333"/><text x="462" y="54" text-anchor="middle">signal (sigwait)</text>
+  <rect x="405" y="72" width="115" height="30" fill="#fff" stroke="#333"/><text x="462" y="91" text-anchor="middle">admin (UNIX sock)</text>
+  <rect x="405" y="109" width="115" height="30" fill="#fff" stroke="#333"/><text x="462" y="128" text-anchor="middle">rate (every 100ms)</text>
+  <rect x="405" y="146" width="115" height="30" fill="#fff" stroke="#333"/><text x="462" y="165" text-anchor="middle">aging (every 1s)</text>
+  <rect x="405" y="183" width="115" height="30" fill="#f2f2f2" stroke="#333"/><text x="462" y="202" text-anchor="middle">shm counters</text>
+  <rect x="405" y="220" width="115" height="30" fill="#fff" stroke="#333"/><text x="462" y="239" text-anchor="middle">logger</text>
+
+  <!-- outside -->
+  <rect x="560" y="72" width="90" height="30" fill="#f2f2f2" stroke="#333"/><text x="605" y="91" text-anchor="middle">swctl</text>
+  <line x1="558" y1="87" x2="522" y2="87" stroke="#333" marker-end="url(#a)"/>
+  <path d="M605,102 L605,198 L522,198" fill="none" stroke="#333" stroke-dasharray="4,2" marker-end="url(#a)"/>
+  <text x="610" y="160" font-size="8.5" fill="#444">stats</text>
+  <rect x="560" y="220" width="90" height="30" fill="#f2f2f2" stroke="#333"/><text x="605" y="239" text-anchor="middle">switch.log</text>
+  <line x1="520" y1="235" x2="558" y2="235" stroke="#333" marker-end="url(#a)"/>
+  <rect x="560" y="20" width="90" height="30" fill="#f2f2f2" stroke="#333"/><text x="605" y="39" text-anchor="middle" font-size="8.5">kill -INT/HUP/USR1</text>
+  <line x1="558" y1="45" x2="522" y2="48" stroke="#333" marker-end="url(#a)"/>
+</svg>
+</div>
+<div class="cap">Figure 1. Threads of the switch. Each connected port has its own rx and tx thread; the six threads on the right exist once. The dashed arrow is port 0&rsquo;s rx putting a frame on port 1&rsquo;s queue.</div>
+
+<table class="avoid">
+<tr><th>Thread</th><th>Count</th><th>What it does</th></tr>
+<tr><td>main</td><td>1</td><td>Blocks the signals, starts the others, then loops: wait on the <code>free_ports</code> semaphore (with a timeout), <code>accept</code>, attach the host to a free port. On timeout it sends a <code>switch full</code> frame and closes. At the end it runs the shutdown and joins everything.</td></tr>
+<tr><td>rx (per port)</td><td>&le; n</td><td>Reads frames with <code>read_full</code>, learns the source MAC, looks up the destination and puts one refcounted copy of the frame on each output queue. Never blocks on another host. On EOF it cleans up the port and posts the semaphore.</td></tr>
+<tr><td>tx (per port)</td><td>&le; n</td><td>Waits on the port's <code>not_empty</code> condition, picks the next frame by weighted round robin (5:3:1 with aging), waits for a token if the port is rate limited, and writes it.</td></tr>
+<tr><td>signal</td><td>1</td><td><code>sigwait</code> on INT/TERM (shutdown), HUP (reload config), USR1 (dump MAC table).</td></tr>
+<tr><td>admin</td><td>1</td><td>Accepts <code>swctl</code> on <code>/tmp/vswitch.sock</code>, runs one command, sends the reply.</td></tr>
+<tr><td>rate / aging</td><td>1 + 1</td><td>Refill every port's token bucket every 100 ms / remove MACs older than <code>mac_age</code> every second.</td></tr>
+<tr><td>logger</td><td>1</td><td>Takes lines off the log queue and writes them to <code>switch.log</code> with timestamps. Other threads never wait on the disk.</td></tr>
+</table>
+
+<h2>3. Locks and what they protect</h2>
+<table>
+<tr><th>Lock</th><th>Protects</th></tr>
+<tr><td><code>attach_lock</code></td><td>Choosing a port for a new host, and <code>swctl shutdown/up</code>. Keeps the <code>free_ports</code> semaphore count in step with the ports' <code>enabled</code> flags.</td></tr>
+<tr><td>port <code>lock</code> (one per port)</td><td>Everything in <code>struct port</code>: <code>fd</code>, <code>state</code> (FREE/UP/CLOSING/DONE), <code>enabled</code>, <code>draining</code>, the three QoS rings and WRR state, <code>vlan</code>, <code>trunk</code>, <code>mirror_to</code>, <code>rate</code>, <code>tokens</code>. Used with the conditions <code>not_empty</code> (tx waits for frames) and <code>done</code> (shutdown waits for the port to close).</td></tr>
+<tr><td>MAC bucket locks (16)</td><td>The linked list of entries in that bucket (mac, port, last_seen). Different MACs usually hash to different buckets so learning on many ports runs in parallel.</td></tr>
+<tr><td><code>count_lock</code></td><td>Table wide numbers: total <code>count</code>, <code>max_entries</code>, <code>max_per_port</code> and the per port MAC counts used for port security.</td></tr>
+<tr><td>shm mutex</td><td>The per port in/out/dropped/mirrored counters in <code>/dev/shm/vswitch_stats</code>. It is <code>PTHREAD_PROCESS_SHARED</code> so <code>swctl stats</code> can lock it from another process.</td></tr>
+<tr><td><code>cfg_lock</code></td><td>The current <code>struct config</code>. Readers copy it out with <code>get_config()</code>; SIGHUP swaps in a new one.</td></tr>
+<tr><td>log lock</td><td>The 1024 line log queue, its head/count and the dropped counter (condition <code>not_empty</code> wakes the logger).</td></tr>
+<tr><td><code>stop_lock</code></td><td>The <code>stopping</code> flag. <code>stop_cond</code> is used for every timed wait so shutdown can wake them.</td></tr>
+</table>
+<p>Not locks but also shared: the <code>free_ports</code> semaphore (counts free ports) and an <code>atomic_int</code>
+reference count in each frame. A broadcast is stored once; every queue that takes it adds a reference and the last
+<code>pkt_put</code> frees it.</p>
+
+<h2>4. Lock order</h2>
+<p>Locks are always taken in this order, and a thread never holds two port locks at the same time:</p>
+<ol>
+<li><code>attach_lock</code></li>
+<li>one port lock</li>
+<li>MAC bucket locks, in ascending bucket index when more than one is needed</li>
+<li><code>count_lock</code></li>
+<li>leaf locks: shm mutex, <code>cfg_lock</code>, log lock, <code>stop_lock</code>. Nothing is locked while holding one of these.</li>
+</ol>
+<p>How the code keeps to it:</p>
+<ul>
+<li><b>Forwarding</b> touches several ports but one at a time. <code>forward()</code> reads the input port's VLAN and
+mirror setting under its lock and unlocks, then <code>port_enqueue()</code> locks each output port separately. Mirror
+copies are queued after unlocking the port, so a frame from port 0 mirrored to port 2 never holds both locks.</li>
+<li><b>MAC insert</b> takes the bucket lock, then <code>count_lock</code>. If the table is over its limit, eviction runs
+<i>after</i> the bucket is unlocked, scans the buckets one at a time, then relocks the chosen bucket and only removes
+the entry if its <code>last_seen</code> did not change in between.</li>
+<li><b>clear mac</b> locks buckets 0 to 15 in order, then <code>count_lock</code>, and unlocks in reverse.</li>
+<li><b>swctl shutdown</b> takes <code>attach_lock</code> then the port lock, then waits on the port's <code>done</code>
+condition (which releases the port lock) for at most 2 seconds while tx drains the queue. The rx thread's cleanup only
+needs the port lock and bucket locks, never <code>attach_lock</code>, so it can always finish.</li>
+<li>Counters, config and logging are leaves, so they can be used from anywhere (for example the dropped counter is
+increased inside <code>port_enqueue</code> while the port lock is held).</li>
+</ul>
+
+<h2>5. A real bug: priority queues that turned into FIFO</h2>
+<p><b>What happened.</b> For item 6 each port has three queues served 5:3:1, plus aging so low priority never starves.
+My first aging rule was per frame: if the oldest frame in any queue had waited more than 200 ms, send it next.
+<code>tests/test_priority.py</code>, where host B stops reading while A sends 40 low, then 40 normal, then 40 high
+frames, then counts how many frames B gets after the last high one, failed 3 times out of 5. The high frames were
+coming out last, which is what plain FIFO would do.</p>
+<p><b>How I found it.</b> The failure only showed up with a long backlog, which pointed at aging rather than WRR.
+While B is not reading, the queues fill up and stay full. Every frame waits more than 200 ms, so every frame
+counts as "aged", and "send the oldest aged frame" is just FIFO. Aging was overriding WRR all the time instead of only
+rescuing a starved queue.</p>
+<p><b>The fix.</b> Aging is now per queue, not per frame. A queue gets one extra turn only if it is non empty and has
+not been <i>served</i> for 200 ms (measured from the later of its last service and its head frame's arrival). After
+that turn its timer resets and normal 5:3:1 continues. I added <code>test_old_backlog</code> in
+<code>tests/test_qos.c</code>, which uses fake time: 40 frames per queue, all "old", and checks that 27 pops give exactly
+15 high, 9 normal and 3 low. <code>test_priority.py</code> now passes every time, with the pattern HHHHHNNNL visible
+in the output.</p>
+<p><b>A related surprise.</b> Before that, priorities did nothing at all: the kernel's socket send buffer (a few MB)
+accepted every frame immediately, in order, so our queues were always empty. Setting <code>SO_SNDBUF</code> to 8 KB
+on each host socket makes the backlog build up in our queues where WRR can reorder it.</p>
+
+<h2>6. Items completed and testing</h2>
+<p><b>Tier 1:</b> all of items 1 to 5. <b>Tier 2:</b> all of items 6 to 13 (QoS with WRR and aging, token bucket rate
+limit, VLANs and trunk, port mirroring, live reconfiguration, <code>swctl</code> with shared memory counters, signals,
+logger thread). <b>Tier 3:</b> not attempted.</p>
+<p><b>Testing.</b> <code>make check</code> runs 3 C unit tests and 12 live tests, each against a fresh switch, and
+stops it with SIGINT (it must exit 0). The live tests cover forwarding and learning, a frozen host that never reads
+(other hosts still get 100/100 frames), broadcast storms with hosts joining and leaving, MAC flooding (port security),
+the port limit and <code>switch full</code>, priorities, rate limiting, VLANs, admin commands, mirroring, SIGINT in
+five situations, and a stress test that runs traffic, host churn and about 30,000 random <code>swctl</code> commands
+at once and then checks that all 8 ports come back free. The build uses <code>-Wall -Wextra -Werror</code>.</p>
+<p><span class="todo">[TODO: add ThreadSanitizer and valgrind results here once they are run.]</span></p>
+
+</body>
+</html>
